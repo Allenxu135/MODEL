@@ -1,140 +1,131 @@
-import ollama
-import time
-from pathlib import Path
+import os
 import json
-from tqdm import tqdm
+import csv
+import argparse
+from datetime import datetime
+from model import OllamaModel
 
 
-class ModelTrainer:
-    def __init__(self, base_model: str, data_path: str, output_name: str):
+class KnowledgeTrainer:
+    def __init__(self, base_model="mistral"):
         self.base_model = base_model
-        self.data_path = data_path
-        self.output_name = output_name
-        self.validation_split = 0.15  # 15%数据用于验证
+        self.client = OllamaModel(base_model)
 
-    def _prepare_dataset(self) -> str:
-        """将数据集转换为Ollama要求的聊天格式"""
-        # 读取并预处理完整数据集
-        with open(self.data_path, 'r', encoding='utf-8') as f:
-            samples = [line.strip() for line in f if line.strip()]
+    def _load_data(self, data_path):
+        """Load and convert CSV/TXT/JSON to standardized format"""
+        if data_path.endswith('.csv'):
+            with open(data_path, 'r', encoding='utf-8') as f:
+                return [{"instruction": row['question'], "output": row['answer']}
+                        for row in csv.DictReader(f)]
 
-        # 划分训练/验证集
-        split_idx = int(len(samples) * (1 - self.validation_split))
-        train_data = samples[:split_idx]
-        val_data = samples[split_idx:]
+        elif data_path.endswith('.json'):
+            with open(data_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
 
-        # 转换为Ollama格式[4](@ref)
-        def format_chat(sample):
-            return {
-                "messages": [
-                    {"role": "user", "content": sample.split('|')[0]},
-                    {"role": "assistant", "content": sample.split('|')[1]}
-                ]
-            }
+        else:  # TXT processing
+            data = []
+            with open(data_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if '|' in line:
+                        parts = line.strip().split('|', 1)
+                        data.append({"instruction": parts[0].strip(), "output": parts[1].strip()})
+                    else:
+                        data.append({"instruction": line.strip(), "output": ""})
+            return data
 
-        # 保存训练集
-        train_path = f"{self.output_name}_train.jsonl"
-        with open(train_path, 'w') as f:
-            for sample in train_data:
-                f.write(json.dumps(format_chat(sample)) + '\n')
+    def _generate_prompts(self, data):
+        """Convert knowledge to prompt-completion pairs"""
+        return [
+            f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['output']}"
+            for item in data
+        ]
 
-        # 保存验证集
-        val_path = f"{self.output_name}_val.jsonl"
-        with open(val_path, 'w') as f:
-            for sample in val_data:
-                f.write(json.dumps(format_chat(sample)) + '\n')
+    def train(self, data_path, output_model_name, epochs=3):
+        """
+        Core training workflow:
+        :param data_path: Knowledge file path (CSV/TXT/JSON)
+        :param output_model_name: New model identifier
+        :param epochs: Training iterations
+        """
+        # 1. Load and standardize knowledge
+        knowledge = self._load_data(data_path)
+        print(f"✅ Loaded {len(knowledge)} knowledge entries")
 
-        return train_path, val_path
+        # 2. Prepare training data
+        training_data = self._generate_prompts(knowledge)
 
-    def _create_modelfile(self, train_path: str) -> str:
-        """生成包含完整训练参数的Modelfile"""
-        modelfile_content = f"""
+        # 3. Configure adapter training (Parameter-Efficient Fine-Tuning)
+        from peft import LoraConfig, get_peft_model
+        from transformers import TrainingArguments, Trainer
+
+        peft_config = LoraConfig(
+            r=8,
+            lora_alpha=32,
+            target_modules=["q_proj", "v_proj"],
+            lora_dropout=0.05,
+            task_type="CAUSAL_LM"
+        )
+        adapter_model = get_peft_model(self.client.model, peft_config)
+
+        # 4. Set up training environment
+        training_args = TrainingArguments(
+            output_dir="./adapters",
+            num_train_epochs=epochs,
+            per_device_train_batch_size=4,
+            save_strategy="epoch",
+            learning_rate=2e-4,
+            report_to="none"
+        )
+
+        # 5. Execute training
+        trainer = Trainer(
+            model=adapter_model,
+            args=training_args,
+            train_dataset=training_data,
+        )
+        print("🚀 Starting knowledge injection...")
+        trainer.train()
+
+        # 6. Save deployable model
+        self._export_model(adapter_model, output_model_name)
+        print(f"🎉 Knowledge-optimized model saved as '{output_model_name}'")
+        print(f"Use in model.py: model = OllamaModel('{output_model_name}')")
+
+    def _export_model(self, model, name):
+        """Package model for Ollama deployment"""
+        from transformers import AutoTokenizer
+        import torch
+
+        # 1. Save adapter weights
+        model.save_pretrained(f"./adapters/{name}")
+
+        # 2. Generate Ollama Modelfile
+        modelfile = f"""
 FROM {self.base_model}
-SYSTEM "您是一个领域专家助手"
-PARAMETER num_epochs 5
-PARAMETER learning_rate 0.0002
-PARAMETER num_ctx 4096
-TEMPLATE """
-        # 添加完整训练数据引用
-        modelfile_content += f"\"\"\"{Path(train_path).read_text(encoding='utf-8')}\"\"\"\n"
+ADAPTER ./adapters/{name}
+TEMPLATE \"\"\"[INST] {{ .System }} {{ .Prompt }} [/INST]
+\"\"\"
+SYSTEM \"\"\"You are a {name} assistant with specialized knowledge\"\"\"
+        """
+        with open(f"./models/Modelfile.{name}", "w") as f:
+            f.write(modelfile.strip())
 
-        modelfile_path = f"{self.output_name}.Modelfile"
-        with open(modelfile_path, 'w', encoding='utf-8') as f:
-            f.write(modelfile_content)
-
-        return modelfile_path
-
-    def _monitor_training(self, job_id: str):
-        """实时监控训练进度"""
-        print(f"🚀 训练已启动 | 任务ID: {job_id}")
-        progress_bar = tqdm(total=100, desc="训练进度")
-        prev_progress = 0
-
-        while True:
-            status = ollama.show(job_id)
-            current = status.get('progress', 0)
-
-            # 更新进度条
-            if current > prev_progress:
-                progress_bar.update(current - prev_progress)
-                prev_progress = current
-
-            # 完成检测
-            if status.get('status') == 'completed':
-                progress_bar.close()
-                print(f"✅ 训练完成! 峰值准确率: {status['metrics']['accuracy']:.2%}")
-                return
-
-            # 错误处理
-            if status.get('status') == 'failed':
-                progress_bar.close()
-                print(f"❌ 训练失败: {status['error']}")
-                exit(1)
-
-            time.sleep(5)
-
-    def fine_tune(self):
-        """执行端到端微调流程"""
-        # 1. 数据预处理
-        train_path, val_path = self._prepare_dataset()
-        print(
-            f"📊 数据集加载完成 | 训练样本: {Path(train_path).read_text().count('')} | 验证样本: {Path(val_path).read_text().count('')}")
-
-        # 2. 创建训练配置
-        modelfile_path = self._create_modelfile(train_path)
-        print(f"⚙️ 生成Modelfile: {modelfile_path}")
-
-        # 3. 启动训练任务
-        job = ollama.create(
-            name=self.output_name,
-            modelfile=modelfile_path,
-            stream=False
-        )
-
-        # 4. 监控训练过程
-        self._monitor_training(job['id'])
-
-        # 5. 模型验证
-        val_results = ollama.evaluate(
-            model=self.output_name,
-            dataset=val_path,
-            metrics=['perplexity', 'accuracy']
-        )
-        print(f"🧪 验证结果: 困惑度={val_results['perplexity']:.2f} | 准确率={val_results['accuracy']:.2%}")
-
-        return {
-            "model": self.output_name,
-            "val_metrics": val_results
-        }
+        # 3. Build new Ollama model
+        os.system(f"ollama create {name} -f ./models/Modelfile.{name}")
 
 
 if __name__ == "__main__":
-    trainer = ModelTrainer(
-        base_model="llama3",
-        data_path="finance_qa.txt",  # 格式: 问题|答案
-        output_name="finance-expert-v1"
-    )
+    parser = argparse.ArgumentParser(description="Knowledge Injection Trainer")
+    parser.add_argument("--data", required=True, help="Path to knowledge file (CSV/TXT/JSON)")
+    parser.add_argument("--model", required=True, help="Output model name")
+    parser.add_argument("--base", default="mistral", help="Base model name")
+    parser.add_argument("--epochs", type=int, default=3, help="Training epochs")
 
-    result = trainer.fine_tune()
-    print(f"\n🦙 新模型 '{result['model']}' 已部署!")
-    print("💡 在model.py中选择此模型进行对话测试")
+    args = parser.parse_args()
+
+    print(f"🧠 Starting knowledge training at {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    print(f"Base model: {args.base}")
+    print(f"Knowledge source: {args.data}")
+
+    trainer = KnowledgeTrainer(args.base)
+    trainer.train(args.data, args.model, args.epochs)
