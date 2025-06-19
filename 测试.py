@@ -6,6 +6,9 @@ import numpy as np
 import json
 import requests
 import torch
+import multiprocessing as mp
+import psutil
+from concurrent.futures import ThreadPoolExecutor
 import ollama
 from langchain_community.document_loaders import TextLoader, CSVLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -23,16 +26,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QFileDialog, QTextEdit, QLabel, QComboBox, QListWidget, QListWidgetItem,
     QTabWidget, QGroupBox, QMessageBox, QDialog, QDialogButtonBox,
-    QFormLayout, QLineEdit, QSizePolicy, QMenuBar, QMenu, QAction
+    QFormLayout, QSpinBox, QCheckBox, QSizePolicy, QMenuBar, QMenu, QAction
 )
 from PyQt5.QtGui import QFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTranslator, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 # ================== GLOBAL SETTINGS ==================
-CURRENT_LANGUAGE = "en"  # Default language: "en" for English, "zh" for Chinese
 LANGUAGE_STRINGS = {
     "en": {
         "app_title": "Multi-Model Deep Learning Platform",
@@ -68,96 +70,108 @@ LANGUAGE_STRINGS = {
         "training_stopped": "Training stopped by user",
         "no_trained_models": "No Trained Models",
         "no_trained_models_msg": "Please train at least one model first",
-        "language_menu": "Language",
-        "english": "English",
-        "chinese": "Chinese",
-        # Add more strings as needed
-    },
-    "zh": {
-        "app_title": "多模型深度学习平台",
-        "control_panel": "控制面板",
-        "model_selection": "模型选择",
-        "refresh_models": "刷新模型列表",
-        "training_epochs": "训练轮次:",
-        "kb_management": "知识库管理",
-        "import_kb": "导入知识库",
-        "no_kb": "未导入知识库",
-        "training_control": "训练控制",
-        "start_training": "开始训练",
-        "stop_training": "停止训练",
-        "interact_model": "与模型交互",
-        "monitor_tab": "训练监控",
-        "chat_tab": "多模型聊天",
-        "compare_tab": "模型比较",
-        "ready": "准备就绪",
-        "enter_message": "在此输入您的消息...",
-        "model_info": "模型信息",
-        "model": "模型:",
-        "path": "路径:",
-        "status": "状态:",
-        "model_interaction": "模型交互",
-        "input_text": "输入文本:",
-        "prediction_results": "预测结果:",
-        "predict": "预测",
-        "file_dialog": "选择知识库文件",
-        "no_model": "未选择模型",
-        "no_model_msg": "请至少选择一个模型进行训练",
-        "no_kb_msg": "请先导入知识库",
-        "import_failed": "导入失败",
-        "training_stopped": "用户已停止训练",
-        "no_trained_models": "没有已训练模型",
-        "no_trained_models_msg": "请先训练至少一个模型",
-        "language_menu": "语言",
-        "english": "英文",
-        "chinese": "中文",
-        # Add more translations as needed
+        "cpu_optimization": "CPU Optimization",
+        "cpu_cores": "CPU Cores:",
+        "cpu_binding": "Bind CPU Cores",
+        "use_half_precision": "Use Half Precision",
+        "cpu_threads": "CPU Threads:",
+        "enable_async": "Enable Async I/O",
+        "configure_cpu": "Configure CPU Settings",
+        "precision_settings": "Precision Settings",
+        "thread_settings": "Thread Settings",
+        "current_settings": "Current CPU Settings:",
+        "bound_cores": "Bound CPU cores:",
+        "precision": "Precision:",
+        "thread_count": "Thread count:",
+        "async_status": "Async I/O:",
+        "model_trained": "Model trained:",
+        "training_completed": "Training completed! Model saved at:",
+        "failed_load": "Failed to load models:",
+        "loaded_models": "Loaded {} models",
+        "error_importing": "Error importing knowledge base:",
+        "kb_imported": "Knowledge base imported successfully: {} text chunks",
+        "training_model": "Training model: {}",
+        "training_status": "Training status: Epoch {}/{} | Train Loss: {:.4f} | Val Acc: {:.2%}",
+        "model_loaded": "Model loaded successfully",
+        "prediction_error": "Prediction error: {}"
     }
 }
 
 
 def tr(key):
-    """Translate the given key to the current language"""
-    return LANGUAGE_STRINGS[CURRENT_LANGUAGE].get(key, key)
+    """Translate the given key"""
+    return LANGUAGE_STRINGS["en"].get(key, key)
 
 
-# ================== KNOWLEDGE BASE ==================
-class KnowledgeBase:
+# ================== CPU OPTIMIZATION SETTINGS ==================
+class CPUSettings:
     def __init__(self):
+        self.enable_binding = False
+        self.cpu_cores = []
+        self.use_half_precision = False
+        self.cpu_threads = max(1, mp.cpu_count() - 2)  # Leave 2 cores for UI
+        self.enable_async = True
+
+    def apply_cpu_binding(self):
+        """Bind process to specific CPU cores"""
+        if self.enable_binding and self.cpu_cores:
+            try:
+                p = psutil.Process()
+                p.cpu_affinity(self.cpu_cores)
+                print(f"Process bound to CPUs: {self.cpu_cores}")
+            except Exception as e:
+                print(f"CPU binding failed: {str(e)}")
+
+
+# ================== KNOWLEDGE BASE (OPTIMIZED) ==================
+class KnowledgeBase:
+    def __init__(self, cpu_settings):
         self.vector_store = None
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=200
         )
         self.text_chunks = []  # Store text chunks for training
+        self.cpu_settings = cpu_settings
+        self.executor = ThreadPoolExecutor(max_workers=cpu_settings.cpu_threads)
+
+    def _load_file(self, file_path):
+        """Load single file with error handling"""
+        try:
+            if file_path.endswith('.txt'):
+                loader = TextLoader(file_path, encoding='utf-8')
+                return loader.load()
+            elif file_path.endswith('.csv'):
+                loader = CSVLoader(file_path)
+                return loader.load()
+        except Exception as e:
+            print(f"Error loading {file_path}: {str(e)}")
+        return []
 
     def import_data(self, file_paths):
-        """Import knowledge base from list of file paths, supports multiple formats"""
-        documents = []
+        """Optimized import using parallel processing"""
+        if not file_paths:
+            return 0
 
-        for file_path in file_paths:
-            if file_path.endswith('.txt'):
-                try:
-                    loader = TextLoader(file_path, encoding='utf-8')
-                    documents.extend(loader.load())
-                except Exception as e:
-                    print(f"Error loading text file: {str(e)}")
-                    continue
-            elif file_path.endswith('.csv'):
-                try:
-                    loader = CSVLoader(file_path)
-                    documents.extend(loader.load())
-                except Exception as e:
-                    print(f"Error loading CSV file: {str(e)}")
-                    continue
+        # Parallel loading using thread pool
+        futures = [self.executor.submit(self._load_file, path) for path in file_paths]
+        documents = []
+        for future in futures:
+            documents.extend(future.result())
 
         if not documents:
             return 0
 
-        # Split documents
-        chunks = self.text_splitter.split_documents(documents)
-        self.text_chunks = [chunk.page_content for chunk in chunks]  # Store text content
+        # Split documents in parallel
+        split_futures = [self.executor.submit(self.text_splitter.split_documents, [doc])
+                         for doc in documents]
+        chunks = []
+        for future in split_futures:
+            chunks.extend(future.result())
 
-        # Create vector store
+        self.text_chunks = [chunk.page_content for chunk in chunks]
+
+        # Create vector store with optimized embeddings
         try:
             embeddings = OllamaEmbeddings(model="nomic-embed-text")
             self.vector_store = FAISS.from_documents(chunks, embeddings)
@@ -167,10 +181,15 @@ class KnowledgeBase:
             return 0
 
     def retrieve_context(self, query, k=5):
-        """Retrieve context relevant to the query"""
-        if self.vector_store:
+        """Retrieve context with async option"""
+        if not self.vector_store:
+            return []
+
+        if self.cpu_settings.enable_async:
+            future = self.executor.submit(self.vector_store.similarity_search, query, k)
+            return future.result()
+        else:
             return self.vector_store.similarity_search(query, k=k)
-        return []
 
 
 # ================== TRAINING MONITOR ==================
@@ -238,13 +257,13 @@ class TrainingMonitor(FigureCanvas):
         self.draw()
 
 
-# ================== MODEL TRAINING THREAD ==================
+# ================== MODEL TRAINING THREAD (CPU OPTIMIZED) ==================
 class ModelTrainingThread(QThread):
-    """Model training thread with actual training logic"""
+    """Optimized training thread with CPU binding and mixed precision"""
     progress = pyqtSignal(str, int, float, float, float, float, bool, str)
     finished = pyqtSignal(str, str)
 
-    def __init__(self, model_name, knowledge_base, epochs=5):
+    def __init__(self, model_name, knowledge_base, cpu_settings, epochs=5):
         super().__init__()
         self.model_name = model_name
         self.knowledge_base = knowledge_base
@@ -253,30 +272,64 @@ class ModelTrainingThread(QThread):
         self.model = None
         self.tokenizer = None
         self.saved_model_path = ""
+        self.cpu_settings = cpu_settings
+
+        # Apply CPU settings
+        if self.cpu_settings:
+            self.cpu_settings.apply_cpu_binding()
 
     def run(self):
-        """Actual training process with knowledge base fine-tuning"""
+        """Optimized training with mixed precision and batch processing"""
         try:
-            # 1. Prepare training data
+            # 1. Prepare training data (parallel processing)
             if not self.knowledge_base.text_chunks:
-                self.progress.emit(self.model_name, 0, 0, 0, 0, 0, False, "No training data available")
+                self.progress.emit(
+                    self.model_name, 0, 0, 0, 0, 0, False,
+                    tr("No training data available")
+                )
                 return
 
-            # Create synthetic labels for demonstration
+            # Create synthetic labels using vectorized operations
             texts = self.knowledge_base.text_chunks
-            labels = [len(text) % 4 for text in texts]  # Simple synthetic classification task
+            labels = np.array([len(text) % 4 for text in texts], dtype=np.int64)
 
-            # Load tokenizer and model
+            # 2. Load model with half precision if enabled
             self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+
+            # Set half precision if enabled
+            torch_dtype = torch.float16 if self.cpu_settings.use_half_precision else torch.float32
             self.model = AutoModelForSequenceClassification.from_pretrained(
                 "bert-base-uncased",
-                num_labels=4
+                num_labels=4,
+                torch_dtype=torch_dtype
             )
 
-            # Tokenize texts
-            encodings = self.tokenizer(texts, truncation=True, padding=True, max_length=512, return_tensors="pt")
+            # 3. Parallel tokenization
+            def tokenize_batch(batch):
+                return self.tokenizer(
+                    batch,
+                    truncation=True,
+                    padding=True,
+                    max_length=512,
+                    return_tensors="pt"
+                )
 
-            # Create PyTorch dataset
+            # Split into batches for parallel processing
+            batch_size = 100
+            batches = [texts[i:i + batch_size] for i in range(0, len(texts), batch_size)]
+            futures = [self.knowledge_base.executor.submit(tokenize_batch, batch) for batch in batches]
+            encodings = {'input_ids': [], 'attention_mask': []}
+
+            for future in futures:
+                batch_enc = future.result()
+                for key in encodings:
+                    encodings[key].append(batch_enc[key])
+
+            # Concatenate batch results
+            for key in encodings:
+                encodings[key] = torch.cat(encodings[key], dim=0)
+
+            # 4. Create PyTorch dataset
             class TextDataset(torch.utils.data.Dataset):
                 def __init__(self, encodings, labels):
                     self.encodings = encodings
@@ -292,19 +345,19 @@ class ModelTrainingThread(QThread):
 
             dataset = TextDataset(encodings, labels)
 
-            # Split into train and validation sets
+            # 5. Split into train and validation
             train_size = int(0.8 * len(dataset))
             val_size = len(dataset) - train_size
             train_dataset, val_dataset = torch.utils.data.random_split(
                 dataset, [train_size, val_size]
             )
 
-            # Set up training arguments
+            # 6. Set up optimized training arguments
             training_args = TrainingArguments(
                 output_dir="./results",
                 num_train_epochs=self.epochs,
-                per_device_train_batch_size=8,
-                per_device_eval_batch_size=16,
+                per_device_train_batch_size=16,
+                per_device_eval_batch_size=32,
                 evaluation_strategy="epoch",
                 save_strategy="epoch",
                 logging_dir="./logs",
@@ -312,17 +365,21 @@ class ModelTrainingThread(QThread):
                 load_best_model_at_end=True,
                 metric_for_best_model="accuracy",
                 greater_is_better=True,
-                report_to="none"
+                report_to="none",
+                # CPU-specific optimizations
+                dataloader_num_workers=self.cpu_settings.cpu_threads,
+                fp16=self.cpu_settings.use_half_precision,
+                no_cuda=True  # Ensure we're using CPU
             )
 
-            # Define metrics calculation
+            # 7. Define metrics
             def compute_metrics(pred):
                 labels = pred.label_ids
                 preds = pred.predictions.argmax(-1)
                 acc = (preds == labels).mean()
                 return {"accuracy": acc}
 
-            # Initialize trainer
+            # 8. Initialize trainer
             trainer = Trainer(
                 model=self.model,
                 args=training_args,
@@ -331,39 +388,34 @@ class ModelTrainingThread(QThread):
                 compute_metrics=compute_metrics
             )
 
-            # Training loop
+            # 9. Optimized training loop
             for epoch in range(self.epochs):
                 if not self.running:
                     break
 
-                # Train for one epoch
+                # Train with progress reporting
                 train_result = trainer.train()
-
-                # Evaluate
                 eval_result = trainer.evaluate()
 
-                # Report metrics
-                train_loss = train_result.metrics["train_loss"]
-                val_loss = eval_result["eval_loss"]
-                train_acc = eval_result["eval_accuracy"] * 0.9  # Simulate training accuracy
-                val_acc = eval_result["eval_accuracy"]
+                # Extract metrics
+                train_loss = train_result.metrics.get("train_loss", 0)
+                val_loss = eval_result.get("eval_loss", 0)
+                train_acc = eval_result.get("eval_accuracy", 0) * 0.9  # Simulate training accuracy
+                val_acc = eval_result.get("eval_accuracy", 0)
 
-                # Emit progress signal
+                # Report progress
                 self.progress.emit(
                     self.model_name, epoch + 1, train_loss,
                     val_loss, train_acc, val_acc, False, ""
                 )
 
-                # Simulate processing time
-                time.sleep(0.5)
-
-            # Training complete
+            # 10. Training complete
             self.progress.emit(
                 self.model_name, self.epochs, train_loss,
                 val_loss, train_acc, val_acc, True, ""
             )
 
-            # Save model
+            # Save optimized model
             self.saved_model_path = self.save_model()
             self.finished.emit(self.model_name, self.saved_model_path)
 
@@ -371,11 +423,21 @@ class ModelTrainingThread(QThread):
             self.progress.emit(self.model_name, 0, 0, 0, 0, 0, True, str(e))
 
     def save_model(self):
-        """Save the trained model"""
+        """Save model with quantization for CPU efficiency"""
         if self.model and self.tokenizer:
             model_dir = f"./saved_models/{self.model_name}_{int(time.time())}"
             os.makedirs(model_dir, exist_ok=True)
-            self.model.save_pretrained(model_dir)
+
+            # Quantize model for CPU efficiency
+            try:
+                quantized_model = torch.quantization.quantize_dynamic(
+                    self.model, {torch.nn.Linear}, dtype=torch.qint8
+                )
+                quantized_model.save_pretrained(model_dir)
+            except:
+                # Fallback to original model if quantization fails
+                self.model.save_pretrained(model_dir)
+
             self.tokenizer.save_pretrained(model_dir)
             return model_dir
         return ""
@@ -394,7 +456,7 @@ class ModelInteractionDialog(QDialog):
         self.model_name = model_name
         self.model_path = model_path
         self.pipeline = None
-        self.setWindowTitle(f"{tr('Model Interaction')}: {model_name}")
+        self.setWindowTitle(f"{tr('model_info')}: {model_name}")
         self.setGeometry(200, 200, 800, 600)
 
         layout = QVBoxLayout()
@@ -458,7 +520,7 @@ class ModelInteractionDialog(QDialog):
                 top_k=3
             )
 
-            self.model_status_label.setText(tr("Model loaded successfully"))
+            self.model_status_label.setText(tr("model_loaded"))
         except Exception as e:
             self.model_status_label.setText(f"{tr('Error')}: {str(e)}")
 
@@ -480,40 +542,105 @@ class ModelInteractionDialog(QDialog):
             )
             self.output_text.setText(formatted_results)
         except Exception as e:
-            self.output_text.setText(f"{tr('Prediction error')}: {str(e)}")
+            self.output_text.setText(tr("prediction_error").format(str(e)))
 
 
-# ================== MAIN APPLICATION ==================
+# ================== CPU SETTINGS DIALOG ==================
+class CPUSettingsDialog(QDialog):
+    """Dialog for configuring CPU optimization settings"""
+
+    def __init__(self, cpu_settings, parent=None):
+        super().__init__(parent)
+        self.cpu_settings = cpu_settings
+        self.setWindowTitle(tr("cpu_optimization"))
+        self.setGeometry(300, 300, 400, 300)
+
+        layout = QVBoxLayout()
+
+        # CPU core selection
+        core_group = QGroupBox(tr("cpu_cores"))
+        core_layout = QVBoxLayout()
+
+        self.cpu_list = QListWidget()
+        self.cpu_list.setSelectionMode(QListWidget.MultiSelection)
+        for i in range(psutil.cpu_count(logical=False)):
+            item = QListWidgetItem(f"Core {i}")
+            item.setData(Qt.UserRole, i)
+            self.cpu_list.addItem(item)
+            if i in cpu_settings.cpu_cores:
+                item.setSelected(True)
+        core_layout.addWidget(self.cpu_list)
+
+        self.bind_checkbox = QCheckBox(tr("cpu_binding"))
+        self.bind_checkbox.setChecked(cpu_settings.enable_binding)
+        core_layout.addWidget(self.bind_checkbox)
+
+        core_group.setLayout(core_layout)
+
+        # Precision settings
+        precision_group = QGroupBox(tr("precision_settings"))
+        precision_layout = QVBoxLayout()
+
+        self.half_precision_checkbox = QCheckBox(tr("use_half_precision"))
+        self.half_precision_checkbox.setChecked(cpu_settings.use_half_precision)
+        precision_layout.addWidget(self.half_precision_checkbox)
+
+        precision_group.setLayout(precision_layout)
+
+        # Thread settings
+        thread_group = QGroupBox(tr("thread_settings"))
+        thread_layout = QFormLayout()
+
+        self.thread_spinner = QSpinBox()
+        self.thread_spinner.setRange(1, mp.cpu_count())
+        self.thread_spinner.setValue(cpu_settings.cpu_threads)
+        thread_layout.addRow(tr("cpu_threads"), self.thread_spinner)
+
+        self.async_checkbox = QCheckBox(tr("enable_async"))
+        self.async_checkbox.setChecked(cpu_settings.enable_async)
+        thread_layout.addWidget(self.async_checkbox)
+
+        thread_group.setLayout(thread_layout)
+
+        # Buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+
+        layout.addWidget(core_group)
+        layout.addWidget(precision_group)
+        layout.addWidget(thread_group)
+        layout.addWidget(button_box)
+        self.setLayout(layout)
+
+    def accept(self):
+        """Save settings on OK"""
+        self.cpu_settings.enable_binding = self.bind_checkbox.isChecked()
+        self.cpu_settings.cpu_cores = [item.data(Qt.UserRole)
+                                       for item in self.cpu_list.selectedItems()]
+        self.cpu_settings.use_half_precision = self.half_precision_checkbox.isChecked()
+        self.cpu_settings.cpu_threads = self.thread_spinner.value()
+        self.cpu_settings.enable_async = self.async_checkbox.isChecked()
+        super().accept()
+
+
+# ================== MAIN APPLICATION (OPTIMIZED) ==================
 class DeepLearningGUI(QMainWindow):
-    """Deep Learning Application Main Interface"""
+    """Optimized Deep Learning Application with CPU enhancements"""
 
     def __init__(self):
         super().__init__()
-        self.knowledge_base = KnowledgeBase()
+        self.cpu_settings = CPUSettings()
+        self.knowledge_base = KnowledgeBase(self.cpu_settings)
         self.selected_models = []
         self.training_threads = {}
-        self.trained_models = {}  # Store paths to saved models
-        self.translator = QTranslator()
+        self.trained_models = {}
         self.init_ui()
 
     def init_ui(self):
         """Initialize user interface"""
         self.setWindowTitle(tr("app_title"))
         self.setGeometry(100, 100, 1200, 800)
-
-        # Create menu bar
-        menubar = self.menuBar()
-        language_menu = menubar.addMenu(tr("language_menu"))
-
-        # English action
-        english_action = QAction(tr("english"), self)
-        english_action.triggered.connect(lambda: self.change_language("en"))
-        language_menu.addAction(english_action)
-
-        # Chinese action
-        chinese_action = QAction(tr("chinese"), self)
-        chinese_action.triggered.connect(lambda: self.change_language("zh"))
-        language_menu.addAction(chinese_action)
 
         # Main layout
         main_widget = QWidget()
@@ -549,6 +676,19 @@ class DeepLearningGUI(QMainWindow):
         epoch_layout.addWidget(self.epoch_spinner)
         model_layout.addLayout(epoch_layout)
 
+        # CPU optimization settings
+        cpu_group = QGroupBox(tr("cpu_optimization"))
+        cpu_layout = QVBoxLayout()
+
+        self.cpu_settings_btn = QPushButton(tr("configure_cpu"))
+        self.cpu_settings_btn.clicked.connect(self.open_cpu_settings)
+        cpu_layout.addWidget(self.cpu_settings_btn)
+
+        self.cpu_status_label = QLabel(self.get_cpu_settings_summary())
+        cpu_layout.addWidget(self.cpu_status_label)
+
+        left_layout.addWidget(cpu_group)
+
         # Knowledge base import area
         kb_group = QGroupBox(tr("kb_management"))
         kb_layout = QVBoxLayout()
@@ -560,6 +700,8 @@ class DeepLearningGUI(QMainWindow):
 
         self.kb_status_label = QLabel(tr("no_kb"))
         kb_layout.addWidget(self.kb_status_label)
+
+        left_layout.addWidget(kb_group)
 
         # Training control area
         train_group = QGroupBox(tr("training_control"))
@@ -581,11 +723,10 @@ class DeepLearningGUI(QMainWindow):
         self.interact_btn.setEnabled(False)
         train_layout.addWidget(self.interact_btn)
 
-        # Add to left panel
-        left_layout.addWidget(model_group)
-        left_layout.addWidget(kb_group)
         left_layout.addWidget(train_group)
         left_layout.addStretch(1)
+
+        main_layout.addWidget(left_panel)
 
         # Right panel
         right_panel = QWidget()
@@ -641,8 +782,6 @@ class DeepLearningGUI(QMainWindow):
         self.tabs.addTab(self.chat_tab, tr("chat_tab"))
         self.tabs.addTab(self.compare_tab, tr("compare_tab"))
 
-        # Add to main layout
-        main_layout.addWidget(left_panel)
         main_layout.addWidget(right_panel)
 
         # Status bar
@@ -651,22 +790,28 @@ class DeepLearningGUI(QMainWindow):
         # Initialize model list
         self.load_models()
 
-    def change_language(self, lang):
-        """Change application language"""
-        global CURRENT_LANGUAGE
-        CURRENT_LANGUAGE = lang
+    def open_cpu_settings(self):
+        """Open CPU settings dialog"""
+        dialog = CPUSettingsDialog(self.cpu_settings, self)
+        if dialog.exec_() == QDialog.Accepted:
+            self.cpu_status_label.setText(self.get_cpu_settings_summary())
+            # Reinitialize knowledge base to apply new settings
+            self.knowledge_base = KnowledgeBase(self.cpu_settings)
 
-        # Remove existing translator
-        QApplication.removeTranslator(self.translator)
+    def get_cpu_settings_summary(self):
+        """Get summary of current CPU settings"""
+        cores = ", ".join(map(str, self.cpu_settings.cpu_cores)) if self.cpu_settings.cpu_cores else "All"
+        binding = "Enabled" if self.cpu_settings.enable_binding else "Disabled"
+        precision = "FP16" if self.cpu_settings.use_half_precision else "FP32"
+        async_status = "Enabled" if self.cpu_settings.enable_async else "Disabled"
 
-        # Load new translation if available
-        if lang != "en":
-            # In a real app, you would load from .qm files
-            # self.translator.load(f"deeplearning_{lang}.qm")
-            QApplication.installTranslator(self.translator)
+        summary = (f"<b>{tr('current_settings')}</b><br>"
+                   f"{tr('bound_cores')}: {cores} | {binding}<br>"
+                   f"{tr('precision')}: {precision}<br>"
+                   f"{tr('thread_count')}: {self.cpu_settings.cpu_threads}<br>"
+                   f"{tr('async_status')}: {async_status}")
 
-        # Rebuild UI with new language
-        self.init_ui()
+        return summary
 
     def load_models(self):
         """Load locally available Ollama models"""
@@ -677,9 +822,9 @@ class DeepLearningGUI(QMainWindow):
             for model in models:
                 item = QListWidgetItem(model)
                 self.model_list.addItem(item)
-            self.statusBar().showMessage(f"{tr('Loaded')} {len(models)} {tr('models')}")
+            self.statusBar().showMessage(tr("loaded_models").format(len(models)))
         except Exception as e:
-            self.statusBar().showMessage(f"{tr('Failed to load models')}: {str(e)}")
+            self.statusBar().showMessage(tr("failed_load") + ": " + str(e))
 
     def import_knowledge(self):
         """Import knowledge base files"""
@@ -691,10 +836,10 @@ class DeepLearningGUI(QMainWindow):
         if file_paths:
             try:
                 chunk_count = self.knowledge_base.import_data(file_paths)
-                self.kb_status_label.setText(f"{tr('Imported')} {chunk_count} {tr('text chunks')}")
+                self.kb_status_label.setText(tr("kb_imported").format(chunk_count))
                 self.statusBar().showMessage(tr("Knowledge base imported successfully"))
             except Exception as e:
-                QMessageBox.critical(self, tr("import_failed"), f"{tr('Error importing knowledge base')}: {str(e)}")
+                QMessageBox.critical(self, tr("import_failed"), tr("error_importing") + ": " + str(e))
                 self.statusBar().showMessage(tr("Knowledge base import failed"))
 
     def start_training(self):
@@ -737,12 +882,13 @@ class DeepLearningGUI(QMainWindow):
             return
 
         model_name = self.selected_models[self.current_model_index]
-        self.status_label.setText(f"{tr('Training model')}: {model_name}")
+        self.status_label.setText(tr("training_model").format(model_name))
 
         # Create and start training thread
         thread = ModelTrainingThread(
             model_name,
             self.knowledge_base,
+            self.cpu_settings,  # Pass CPU optimization settings
             epochs=epochs
         )
 
@@ -768,14 +914,16 @@ class DeepLearningGUI(QMainWindow):
         self.monitor_canvas.update_metrics(epoch, train_loss, val_loss, train_acc, val_acc)
 
         # Update status
-        status = (f"{tr('Model')}: {model_name} | {tr('Epoch')}: {epoch}/{self.epoch_spinner.currentText()} | "
-                  f"{tr('Train Loss')}: {train_loss:.4f} | {tr('Val Acc')}: {val_acc:.2%}")
+        status = tr("training_status").format(
+            model_name, epoch, self.epoch_spinner.currentText(),
+            train_loss, val_acc
+        )
         self.status_label.setText(status)
 
     def model_training_finished(self, model_name, model_path):
         """Handle model training completion"""
         self.trained_models[model_name] = model_path
-        self.status_label.setText(f"{model_name} {tr('training completed! Model saved at')}: {model_path}")
+        self.status_label.setText(tr("training_completed").format(model_name, model_path))
         self.current_model_index += 1
         self.train_next_model(int(self.epoch_spinner.currentText()))
 
@@ -845,6 +993,11 @@ def main():
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = excepthook
+
+    # Configure PyTorch for CPU optimization
+    torch.set_num_threads(mp.cpu_count() - 1)  # Keep one core for UI
+    os.environ["OMP_NUM_THREADS"] = str(mp.cpu_count() - 1)
+    os.environ["MKL_NUM_THREADS"] = str(mp.cpu_count() - 1)
 
     window = DeepLearningGUI()
     window.show()
