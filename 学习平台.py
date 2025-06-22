@@ -7,6 +7,7 @@ import requests
 import torch
 import multiprocessing as mp
 import psutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 import ollama
 from langchain_community.document_loaders import TextLoader, CSVLoader
@@ -27,7 +28,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QGroupBox, QMessageBox, QDialog, QDialogButtonBox,
     QFormLayout, QSpinBox, QCheckBox, QDoubleSpinBox, QSlider, QSplitter
 )
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QColor, QBrush
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -97,38 +98,90 @@ APP_STRINGS = {
     "temperature": "Temperature:",
     "use_context": "Use Knowledge Context",
     "batch_size": "Batch Size:",
-    "learning_rate": "Learning Rate:"
+    "learning_rate": "Learning Rate:",
+    "model_status": "Model Status:",
+    "no_models": "No models available",
+    "install_models": "Please install models in Ollama",
+    "active_model": "Active model: {}",
+    "available_models": "Available: {} models",
+    "model_not_loaded": "Model '{}' not loaded",
+    "select_model": "Select a model",
+    "ollama_unavailable": "Ollama service unavailable",
+    "ollama_running": "Ollama: Running",
+    "ollama_stopped": "Ollama: Not Running",
+    "scanning_models": "Scanning local models...",
+    "models_found": "Found {} models",
+    "model_scan_failed": "Failed to scan models"
 }
 
 
 # ================== TEXT GENERATION MODEL ==================
 class TextGenerationModel:
-    def __init__(self, model_name="llama2"):
-        self.model_name = model_name
-        self.client = None
+    def __init__(self):
+        self.client = ollama.Client()
+        self.available_models = []
+        self.model_name = None
         self.generation_config = {
             "max_new_tokens": 256,
             "temperature": 0.7,
             "top_p": 0.9,
             "repetition_penalty": 1.1
         }
+        self.scan_local_models()
 
-    def load_model(self):
-        """Load text generation model"""
+    def scan_local_models(self):
+        """Scan for locally installed Ollama models"""
+        self.available_models = []
         try:
-            self.client = ollama.Client()
+            # Use Ollama CLI to list models
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                # Parse output to get model names
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > 1:  # Skip header line
+                    for line in lines[1:]:
+                        parts = line.split()
+                        if parts:  # Ensure there's at least one part
+                            model_name = parts[0]
+                            self.available_models.append(model_name)
+
+                # Set default model if any found
+                if self.available_models:
+                    self.model_name = self.available_models[0]
+
             return True
         except Exception as e:
-            print(f"Error loading model: {str(e)}")
+            print(f"Error scanning local models: {str(e)}")
             return False
 
-    def generate_text(self, prompt, context=None):
-        """Generate text based on prompt and context"""
-        if not self.client:
-            return "Model not loaded"
+    def set_model(self, model_name):
+        """Set current model if it exists"""
+        if model_name in self.available_models:
+            self.model_name = model_name
+            return True
+        return False
 
+    def load_model(self):
+        """Verify if current model is available"""
+        if not self.model_name:
+            return False
+        return True  # Since we scanned locally, we know it exists
+
+    def generate_text(self, prompt, context=None):
+        """Generate text with automatic fallback to other models"""
+        if not self.model_name:
+            return "No model available"
+
+        full_prompt = context + "\n\n" + prompt if context else prompt
+
+        # First try with selected model
         try:
-            full_prompt = context + "\n\n" + prompt if context else prompt
             response = self.client.generate(
                 model=self.model_name,
                 prompt=full_prompt,
@@ -136,7 +189,24 @@ class TextGenerationModel:
             )
             return response['response']
         except Exception as e:
-            return f"Error: {str(e)}"
+            error_message = str(e)
+
+        # If fails, try other available models
+        for model in self.available_models:
+            if model == self.model_name:
+                continue
+            try:
+                response = self.client.generate(
+                    model=model,
+                    prompt=full_prompt,
+                    options=self.generation_config
+                )
+                self.model_name = model  # Switch to successful model
+                return response['response']
+            except Exception:
+                continue
+
+        return f"Error: {error_message} | Available models: {', '.join(self.available_models)}"
 
 
 # ================== CPU OPTIMIZATION SETTINGS ==================
@@ -181,7 +251,8 @@ class KnowledgeBase:
             elif file_path.endswith('.csv'):
                 loader = CSVLoader(file_path)
                 return loader.load()
-        except Exception:
+        except Exception as e:
+            print(f"Error loading file {file_path}: {str(e)}")
             return []
         return []
 
@@ -193,7 +264,9 @@ class KnowledgeBase:
         futures = [self.executor.submit(self._load_file, path) for path in file_paths]
         documents = []
         for future in futures:
-            documents.extend(future.result())
+            result = future.result()
+            if result:
+                documents.extend(result)
 
         if not documents:
             return 0
@@ -202,7 +275,9 @@ class KnowledgeBase:
                          for doc in documents]
         chunks = []
         for future in split_futures:
-            chunks.extend(future.result())
+            result = future.result()
+            if result:
+                chunks.extend(result)
 
         self.text_chunks = [chunk.page_content for chunk in chunks]
 
@@ -210,7 +285,8 @@ class KnowledgeBase:
             embeddings = OllamaEmbeddings(model="nomic-embed-text")
             self.vector_store = FAISS.from_documents(chunks, embeddings)
             return len(chunks)
-        except Exception:
+        except Exception as e:
+            print(f"Error creating vector store: {str(e)}")
             return 0
 
     def retrieve_context(self, query, k=5):
@@ -284,7 +360,7 @@ class ModelTrainingThread(QThread):
                 torch_dtype=torch_dtype
             )
 
-            # Tokenization (simplified for demo)
+            # Tokenization
             encodings = self.tokenizer(texts, truncation=True, padding=True,
                                        max_length=512, return_tensors="pt")
 
@@ -361,7 +437,9 @@ class ModelInteractionDialog(QDialog):
         self.model_name = model_name
         self.model_path = model_path
         self.knowledge_base = knowledge_base
-        self.generator = TextGenerationModel(model_name)
+        # Use parent's text generator
+        self.generator = parent.text_generator
+        self.generator.set_model(model_name)
         self.setWindowTitle(f"Model: {model_name}")
         self.setGeometry(200, 200, 900, 700)
 
@@ -388,8 +466,8 @@ class ModelInteractionDialog(QDialog):
         settings_layout = QFormLayout()
 
         self.max_tokens_spin = QSpinBox()
-        self.max_tokens_spin.setRange(10, 2048)
-        self.max_tokens_spin.setValue(256)
+        self.max_tokens_spin.setRange(10, 4096)
+        self.max_tokens_spin.setValue(512)
         settings_layout.addRow(APP_STRINGS["max_tokens"], self.max_tokens_spin)
 
         self.temp_slider = QSlider(Qt.Horizontal)
@@ -582,7 +660,8 @@ class DeepLearningGUI(QMainWindow):
         self.trained_models = {}
         self.text_generator = TextGenerationModel()
         self.init_ui()
-        self.text_generator.load_model()
+        self.update_model_status()
+        self.scan_local_models()
 
     def init_ui(self):
         self.setWindowTitle(APP_STRINGS["app_title"])
@@ -599,6 +678,15 @@ class DeepLearningGUI(QMainWindow):
         left_panel.setMaximumWidth(400)
         left_layout = QVBoxLayout()
 
+        # Ollama service status
+        service_group = QGroupBox("Ollama Service")
+        service_layout = QVBoxLayout()
+        self.service_status = QLabel(APP_STRINGS["ollama_unavailable"])
+        self.service_status.setStyleSheet("font-weight: bold;")
+        service_layout.addWidget(self.service_status)
+        service_group.setLayout(service_layout)
+        left_layout.addWidget(service_group)
+
         # Model selection
         model_group = QGroupBox(APP_STRINGS["model_selection"])
         model_layout = QVBoxLayout()
@@ -608,12 +696,17 @@ class DeepLearningGUI(QMainWindow):
 
         refresh_layout = QHBoxLayout()
         self.refresh_btn = QPushButton(APP_STRINGS["refresh_models"])
-        self.refresh_btn.clicked.connect(self.load_models)
+        self.refresh_btn.clicked.connect(self.scan_local_models)
         refresh_layout.addWidget(self.refresh_btn)
 
         model_layout.addLayout(refresh_layout)
         model_group.setLayout(model_layout)
         left_layout.addWidget(model_group)
+
+        # Model status
+        self.model_status_label = QLabel(APP_STRINGS["scanning_models"])
+        self.model_status_label.setStyleSheet("font-weight: bold;")
+        left_layout.addWidget(self.model_status_label)
 
         # Training settings
         train_settings_group = QGroupBox(APP_STRINGS["training_control"])
@@ -629,8 +722,8 @@ class DeepLearningGUI(QMainWindow):
         self.settings_btn.clicked.connect(self.open_training_settings)
         settings_btn_layout.addWidget(self.settings_btn)
 
-        self.status_label = QLabel(self.get_settings_summary())
-        settings_btn_layout.addWidget(self.status_label)
+        self.settings_status = QLabel(self.get_settings_summary())
+        settings_btn_layout.addWidget(self.settings_status)
 
         train_settings_layout.addRow(settings_btn_layout)
         train_settings_group.setLayout(train_settings_layout)
@@ -716,7 +809,13 @@ class DeepLearningGUI(QMainWindow):
         main_layout.addWidget(left_panel, 1)
         main_layout.addWidget(right_panel, 2)
 
-        self.load_models()
+        # Set up selection handler
+        self.model_list.itemSelectionChanged.connect(self.on_model_selected)
+
+        # Set up status timer
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.check_ollama_service)
+        self.status_timer.start(5000)  # Check every 5 seconds
 
     def get_settings_summary(self):
         return (f"Threads: {self.cpu_settings.cpu_threads} | "
@@ -726,18 +825,94 @@ class DeepLearningGUI(QMainWindow):
     def open_training_settings(self):
         dialog = TrainingSettingsDialog(self.cpu_settings, self)
         if dialog.exec_() == QDialog.Accepted:
-            self.status_label.setText(self.get_settings_summary())
+            self.settings_status.setText(self.get_settings_summary())
             self.knowledge_base = KnowledgeBase(self.cpu_settings)
 
-    def load_models(self):
-        self.model_list.clear()
+    def check_ollama_service(self):
+        """Check if Ollama service is running"""
         try:
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
-            models = [model["name"] for model in response.json().get("models", [])]
+            # Try to get model list to verify service
+            self.text_generator.client.list()
+            self.service_status.setText(APP_STRINGS["ollama_running"])
+            self.service_status.setStyleSheet("color: green;")
+            return True
+        except Exception:
+            self.service_status.setText(APP_STRINGS["ollama_stopped"])
+            self.service_status.setStyleSheet("color: red;")
+            return False
+
+    def scan_local_models(self):
+        """Scan for locally installed Ollama models"""
+        self.model_list.clear()
+        self.model_status_label.setText(APP_STRINGS["scanning_models"])
+        self.model_status_label.setStyleSheet("color: blue;")
+        QApplication.processEvents()  # Update UI immediately
+
+        # Scan models in a separate thread to prevent UI freeze
+        self.scan_thread = ModelScanThread()
+        self.scan_thread.finished.connect(self.handle_model_scan_result)
+        self.scan_thread.start()
+
+    def handle_model_scan_result(self, models, success):
+        """Handle the result of model scanning"""
+        if success and models:
+            self.text_generator.available_models = models
+            self.text_generator.model_name = models[0] if models else None
+
+            # Populate model list
             for model in models:
-                self.model_list.addItem(model)
-        except Exception as e:
-            print(f"Error loading models: {str(e)}")
+                item = QListWidgetItem(model)
+                if model == self.text_generator.model_name:
+                    item.setBackground(QColor(220, 255, 220))
+                self.model_list.addItem(item)
+
+            # Select the first model
+            if self.model_list.count() > 0:
+                self.model_list.item(0).setSelected(True)
+
+            self.model_status_label.setText(
+                APP_STRINGS["models_found"].format(len(models))
+            )
+            self.model_status_label.setStyleSheet("color: green;")
+        else:
+            self.model_list.addItem(APP_STRINGS["no_models"])
+            self.model_list.addItem(APP_STRINGS["install_models"])
+            self.model_status_label.setText(APP_STRINGS["model_scan_failed"])
+            self.model_status_label.setStyleSheet("color: red;")
+
+    def on_model_selected(self):
+        """Update active model when user selects from list"""
+        selected_items = self.model_list.selectedItems()
+        if not selected_items:
+            return
+
+        selected_model = selected_items[0].text()
+        if self.text_generator.set_model(selected_model):
+            # Update UI highlighting
+            for i in range(self.model_list.count()):
+                item = self.model_list.item(i)
+                if item.text() == selected_model:
+                    item.setBackground(QColor(220, 255, 220))
+                else:
+                    item.setBackground(QBrush())
+            self.update_model_status()
+
+    def update_model_status(self):
+        """Update the model status display"""
+        if not self.text_generator.available_models:
+            self.model_status_label.setText(APP_STRINGS["no_models"])
+            self.model_status_label.setStyleSheet("color: red;")
+            return
+
+        if self.text_generator.load_model():
+            status_text = APP_STRINGS["active_model"].format(self.text_generator.model_name)
+            status_text += " | " + APP_STRINGS["available_models"].format(len(self.text_generator.available_models))
+            self.model_status_label.setText(status_text)
+            self.model_status_label.setStyleSheet("color: green;")
+        else:
+            status_text = APP_STRINGS["model_not_loaded"].format(self.text_generator.model_name)
+            self.model_status_label.setText(status_text)
+            self.model_status_label.setStyleSheet("color: red;")
 
     def import_knowledge(self):
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -862,6 +1037,38 @@ class DeepLearningGUI(QMainWindow):
             self.chat_output.append(f"AI: {response}")
         except Exception as e:
             self.chat_output.append(f"AI: Error - {str(e)}")
+
+
+# ================== MODEL SCAN THREAD ==================
+class ModelScanThread(QThread):
+    finished = pyqtSignal(list, bool)  # Models list, success status
+
+    def run(self):
+        models = []
+        success = False
+        try:
+            # Use Ollama CLI to list models
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                # Parse output to get model names
+                lines = result.stdout.strip().split('\n')
+                if len(lines) > 1:  # Skip header line
+                    for line in lines[1:]:
+                        parts = line.split()
+                        if parts:  # Ensure there's at least one part
+                            model_name = parts[0]
+                            models.append(model_name)
+                success = True
+        except Exception as e:
+            print(f"Error scanning local models: {str(e)}")
+
+        self.finished.emit(models, success)
 
 
 # ================== APPLICATION ENTRY POINT ==================
