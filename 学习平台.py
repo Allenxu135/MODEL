@@ -111,7 +111,8 @@ APP_STRINGS = {
     "ollama_stopped": "Ollama: Not Running",
     "scanning_models": "Scanning local models...",
     "models_found": "Found {} models",
-    "model_scan_failed": "Failed to scan models"
+    "model_scan_failed": "Failed to scan models",
+    "select_multiple": "Hold Ctrl/Cmd to select multiple models"
 }
 
 
@@ -219,6 +220,7 @@ class CPUSettings:
         self.enable_async = True
         self.batch_size = 16
         self.learning_rate = 2e-5
+        self.max_parallel_training = max(1, mp.cpu_count() // 2)  # Add parallel training control
 
     def apply_cpu_binding(self):
         """Bind process to specific CPU cores"""
@@ -430,6 +432,93 @@ class ModelTrainingThread(QThread):
         self.running = False
 
 
+# ================== MODEL COMPARISON DIALOG ==================
+class ModelComparisonDialog(QDialog):
+    def __init__(self, model_names, knowledge_base, parent=None):
+        super().__init__(parent)
+        self.model_names = model_names
+        self.knowledge_base = knowledge_base
+        self.generator = parent.text_generator
+        self.setWindowTitle("Model Comparison")
+        self.setGeometry(200, 200, 1200, 800)
+
+        main_layout = QVBoxLayout()
+
+        # Input area
+        input_layout = QHBoxLayout()
+        self.input_text = QTextEdit()
+        self.input_text.setPlaceholderText(APP_STRINGS["enter_message"])
+        self.input_text.setMinimumHeight(100)
+        input_layout.addWidget(self.input_text, 5)
+
+        self.generate_button = QPushButton(APP_STRINGS["predict"])
+        self.generate_button.clicked.connect(self.generate)
+        input_layout.addWidget(self.generate_button, 1)
+
+        main_layout.addLayout(input_layout)
+
+        # Tab widget for model outputs
+        self.tab_widget = QTabWidget()
+        self.output_texts = {}  # model_name -> QTextEdit
+        self.status_labels = {}  # model_name -> QLabel
+
+        for model_name in model_names:
+            tab = QWidget()
+            layout = QVBoxLayout()
+
+            # Model info
+            info_group = QGroupBox(f"Model: {model_name}")
+            info_layout = QFormLayout()
+            status_label = QLabel("Ready")
+            info_layout.addRow(APP_STRINGS["status"], status_label)
+            info_group.setLayout(info_layout)
+            layout.addWidget(info_group)
+
+            # Output area
+            output_text = QTextEdit()
+            output_text.setReadOnly(True)
+            layout.addWidget(output_text)
+
+            tab.setLayout(layout)
+            self.tab_widget.addTab(tab, model_name)
+
+            # Store references
+            self.output_texts[model_name] = output_text
+            self.status_labels[model_name] = status_label
+
+        main_layout.addWidget(self.tab_widget)
+        self.setLayout(main_layout)
+
+    def generate(self):
+        prompt = self.input_text.toPlainText().strip()
+        if not prompt:
+            return
+
+        # Retrieve context once for all models
+        context = None
+        if self.knowledge_base.vector_store:
+            context_chunks = self.knowledge_base.retrieve_context(prompt, k=3)
+            context = "\n".join([c.page_content for c in context_chunks])
+
+        for model_name in self.model_names:
+            # Update status
+            self.status_labels[model_name].setText("Generating...")
+            self.output_texts[model_name].setText("Generating...")
+            QApplication.processEvents()
+
+            try:
+                # Switch model
+                self.generator.set_model(model_name)
+
+                # Generate response
+                response = self.generator.generate_text(prompt, context)
+                self.output_texts[model_name].setText(response)
+                self.status_labels[model_name].setText("Completed")
+            except Exception as e:
+                self.output_texts[model_name].setText(f"Error: {str(e)}")
+                self.status_labels[model_name].setText("Error")
+
+
 # ================== MODEL INTERACTION DIALOG ==================
 class ModelInteractionDialog(QDialog):
     def __init__(self, model_name, model_path, knowledge_base, parent=None):
@@ -437,7 +526,6 @@ class ModelInteractionDialog(QDialog):
         self.model_name = model_name
         self.model_path = model_path
         self.knowledge_base = knowledge_base
-        # Use parent's text generator
         self.generator = parent.text_generator
         self.generator.set_model(model_name)
         self.setWindowTitle(f"Model: {model_name}")
@@ -660,8 +748,7 @@ class DeepLearningGUI(QMainWindow):
         self.trained_models = {}
         self.text_generator = TextGenerationModel()
         self.init_ui()
-        self.update_model_status()
-        self.scan_local_models()
+        self.scan_local_models()  # Fixed: Removed call to non-existent method
 
     def init_ui(self):
         self.setWindowTitle(APP_STRINGS["app_title"])
@@ -691,7 +778,14 @@ class DeepLearningGUI(QMainWindow):
         model_group = QGroupBox(APP_STRINGS["model_selection"])
         model_layout = QVBoxLayout()
 
+        # Add multi-selection hint
+        self.select_hint = QLabel(APP_STRINGS["select_multiple"])
+        self.select_hint.setStyleSheet("font-style: italic; color: gray;")
+        model_layout.addWidget(self.select_hint)
+
         self.model_list = QListWidget()
+        # Enable multi-selection
+        self.model_list.setSelectionMode(QListWidget.ExtendedSelection)
         model_layout.addWidget(self.model_list)
 
         refresh_layout = QHBoxLayout()
@@ -741,10 +835,13 @@ class DeepLearningGUI(QMainWindow):
         self.interact_btn = QPushButton(APP_STRINGS["interact_model"])
         self.interact_btn.clicked.connect(self.open_model_dialog)
         self.interact_btn.setEnabled(False)
+        self.compare_btn = QPushButton("Compare Models")
+        self.compare_btn.clicked.connect(self.open_model_comparison)
 
         train_control_layout.addWidget(self.start_btn)
         train_control_layout.addWidget(self.stop_btn)
         train_control_layout.addWidget(self.interact_btn)
+        train_control_layout.addWidget(self.compare_btn)
         train_control_group.setLayout(train_control_layout)
         left_layout.addWidget(train_control_group)
 
@@ -862,13 +959,12 @@ class DeepLearningGUI(QMainWindow):
             # Populate model list
             for model in models:
                 item = QListWidgetItem(model)
-                if model == self.text_generator.model_name:
-                    item.setBackground(QColor(220, 255, 220))
                 self.model_list.addItem(item)
 
-            # Select the first model
+            # Select the first model by default
             if self.model_list.count() > 0:
                 self.model_list.item(0).setSelected(True)
+                self.on_model_selected()
 
             self.model_status_label.setText(
                 APP_STRINGS["models_found"].format(len(models))
@@ -882,37 +978,14 @@ class DeepLearningGUI(QMainWindow):
 
     def on_model_selected(self):
         """Update active model when user selects from list"""
-        selected_items = self.model_list.selectedItems()
-        if not selected_items:
+        self.selected_models = [item.text() for item in self.model_list.selectedItems()]
+        if not self.selected_models:
             return
 
-        selected_model = selected_items[0].text()
-        if self.text_generator.set_model(selected_model):
-            # Update UI highlighting
-            for i in range(self.model_list.count()):
-                item = self.model_list.item(i)
-                if item.text() == selected_model:
-                    item.setBackground(QColor(220, 255, 220))
-                else:
-                    item.setBackground(QBrush())
-            self.update_model_status()
-
-    def update_model_status(self):
-        """Update the model status display"""
-        if not self.text_generator.available_models:
-            self.model_status_label.setText(APP_STRINGS["no_models"])
-            self.model_status_label.setStyleSheet("color: red;")
-            return
-
-        if self.text_generator.load_model():
-            status_text = APP_STRINGS["active_model"].format(self.text_generator.model_name)
-            status_text += " | " + APP_STRINGS["available_models"].format(len(self.text_generator.available_models))
-            self.model_status_label.setText(status_text)
-            self.model_status_label.setStyleSheet("color: green;")
-        else:
-            status_text = APP_STRINGS["model_not_loaded"].format(self.text_generator.model_name)
-            self.model_status_label.setText(status_text)
-            self.model_status_label.setStyleSheet("color: red;")
+        # Update status display
+        status_text = f"Selected models: {', '.join(self.selected_models)}"
+        self.model_status_label.setText(status_text)
+        self.model_status_label.setStyleSheet("color: green;")
 
     def import_knowledge(self):
         file_paths, _ = QFileDialog.getOpenFileNames(
@@ -928,11 +1001,9 @@ class DeepLearningGUI(QMainWindow):
                 self.kb_status.setText(f"Error: {str(e)}")
 
     def start_training(self):
-        selected_items = [self.model_list.item(i).text()
-                          for i in range(self.model_list.count())
-                          if self.model_list.item(i).isSelected()]
+        self.selected_models = [item.text() for item in self.model_list.selectedItems()]
 
-        if not selected_items:
+        if not self.selected_models:
             QMessageBox.warning(self, APP_STRINGS["no_model"], APP_STRINGS["no_model_msg"])
             return
 
@@ -940,9 +1011,9 @@ class DeepLearningGUI(QMainWindow):
             QMessageBox.warning(self, "No Data", APP_STRINGS["no_kb_msg"])
             return
 
-        self.selected_models = selected_items
         epochs = int(self.epoch_combo.currentText())
 
+        # Create training monitor
         self.monitor_canvas = TrainingMonitor()
         if self.monitor_tab.layout():
             old_canvas = self.monitor_tab.layout().itemAt(0).widget()
@@ -953,37 +1024,23 @@ class DeepLearningGUI(QMainWindow):
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.interact_btn.setEnabled(False)
-        self.current_model_index = 0
-        self.train_next_model(epochs)
 
-    def train_next_model(self, epochs):
-        if self.current_model_index >= len(self.selected_models):
-            self.training_status.setText("All models trained!")
-            self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
-            self.interact_btn.setEnabled(True)
-            return
-
-        model_name = self.selected_models[self.current_model_index]
-        self.training_status.setText(f"Training: {model_name}")
-
-        thread = ModelTrainingThread(
-            model_name,
-            self.knowledge_base,
-            self.cpu_settings,
-            epochs=epochs
-        )
-
-        thread.progress.connect(self.update_training_progress)
-        thread.finished.connect(self.model_training_finished)
-        self.training_threads[model_name] = thread
-        thread.start()
+        # Start training for all selected models
+        for model_name in self.selected_models:
+            thread = ModelTrainingThread(
+                model_name,
+                self.knowledge_base,
+                self.cpu_settings,
+                epochs=epochs
+            )
+            thread.progress.connect(self.update_training_progress)
+            thread.finished.connect(self.model_training_finished)
+            self.training_threads[model_name] = thread
+            thread.start()
 
     def update_training_progress(self, model_name, epoch, train_loss, done, error):
         if error:
             self.training_status.setText(f"Error: {model_name} - {error}")
-            self.current_model_index += 1
-            self.train_next_model(int(self.epoch_combo.currentText()))
             return
 
         self.monitor_canvas.update_metrics(epoch, train_loss)
@@ -997,14 +1054,21 @@ class DeepLearningGUI(QMainWindow):
     def model_training_finished(self, model_name, model_path):
         self.trained_models[model_name] = model_path
         self.training_status.setText(
-            APP_STRINGS["training_completed"].format(model_name, model_path)
+            f"Completed training for {model_name}!\nSaved at: {model_path}"
         )
-        self.current_model_index += 1
-        self.train_next_model(int(self.epoch_combo.currentText()))
+
+        # Enable buttons when all training completes
+        if all(not thread.isRunning() for thread in self.training_threads.values()):
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
+            self.interact_btn.setEnabled(True)
 
     def stop_training(self):
-        for thread in self.training_threads.values():
-            thread.stop()
+        for model_name, thread in self.training_threads.items():
+            if thread.isRunning():
+                thread.stop()
+                thread.wait()  # Wait for thread to safely exit
+
         self.training_status.setText(APP_STRINGS["training_stopped"])
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
@@ -1016,9 +1080,42 @@ class DeepLearningGUI(QMainWindow):
                                 APP_STRINGS["no_trained_models_msg"])
             return
 
-        model_name, model_path = next(iter(self.trained_models.items()))
-        dialog = ModelInteractionDialog(model_name, model_path, self.knowledge_base, self)
-        dialog.exec_()
+        # Create a dialog to select which trained model to interact with
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Select Model for Interaction")
+        layout = QVBoxLayout()
+
+        label = QLabel("Select a trained model to interact with:")
+        layout.addWidget(label)
+
+        model_list = QListWidget()
+        for model_name in self.trained_models:
+            model_list.addItem(model_name)
+        layout.addWidget(model_list)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addWidget(button_box)
+
+        dialog.setLayout(layout)
+
+        if dialog.exec_() == QDialog.Accepted and model_list.currentItem():
+            model_name = model_list.currentItem().text()
+            model_path = self.trained_models[model_name]
+            interaction_dialog = ModelInteractionDialog(model_name, model_path, self.knowledge_base, self)
+            interaction_dialog.exec_()
+
+    def open_model_comparison(self):
+        """Open a dialog to compare multiple models"""
+        selected_models = [item.text() for item in self.model_list.selectedItems()]
+
+        if len(selected_models) < 2:
+            QMessageBox.warning(self, "Selection Error", "Please select at least two models to compare")
+            return
+
+        comparison_dialog = ModelComparisonDialog(selected_models, self.knowledge_base, self)
+        comparison_dialog.exec_()
 
     def send_message(self):
         message = self.chat_input.toPlainText().strip()
