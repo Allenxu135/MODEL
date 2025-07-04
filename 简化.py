@@ -37,6 +37,8 @@ APP_STRINGS = {
     "scanning_models": "Scanning local models...",
     "models_found": "Found {} models",
     "model_scan_failed": "Failed to scan models",
+    "file_not_found": "File not found: {}",
+    "no_valid_files": "No valid files found for import",
 }
 
 
@@ -55,14 +57,15 @@ class TextGenerationModel:
         self.scan_local_models()
 
     def scan_local_models(self):
-        """Scan for locally installed Ollama models"""
+        """Scan for locally installed Ollama models with timeout and error handling"""
         self.available_models = []
         try:
+            # 使用超时和错误处理
             result = subprocess.run(
                 ["ollama", "list"],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=15  # 增加超时时间
             )
 
             if result.returncode == 0:
@@ -72,12 +75,19 @@ class TextGenerationModel:
                         parts = line.split()
                         if parts:
                             model_name = parts[0]
-                            self.available_models.append(model_name)
+                            # 避免重复添加
+                            if model_name not in self.available_models:
+                                self.available_models.append(model_name)
 
                 if self.available_models:
                     self.model_name = self.available_models[0]
-
-            return True
+                return True
+            else:
+                print(f"Ollama list command failed: {result.stderr}")
+                return False
+        except subprocess.TimeoutExpired:
+            print("Ollama list command timed out")
+            return False
         except Exception as e:
             print(f"Error scanning local models: {str(e)}")
             return False
@@ -86,37 +96,62 @@ class TextGenerationModel:
         if model_name in self.available_models:
             self.model_name = model_name
             return True
+        print(f"Model not available: {model_name}")
         return False
 
     def load_model(self):
         if not self.model_name:
+            print("No model selected")
             return False
-        return True
+        try:
+            # 尝试加载模型验证可用性
+            self.client.show(self.model_name)
+            return True
+        except Exception as e:
+            print(f"Error loading model {self.model_name}: {str(e)}")
+            # 尝试回退到其他可用模型
+            for model in self.available_models:
+                if model == self.model_name:
+                    continue
+                try:
+                    self.client.show(model)
+                    self.model_name = model
+                    print(f"Fell back to model: {model}")
+                    return True
+                except:
+                    continue
+            return False
 
     def generate_text(self, prompt, context=None):
         if not self.model_name:
-            return "No model available"
+            return "No model available. Please scan for models first."
 
         full_prompt = context + "\n\n" + prompt if context else prompt
 
         try:
+            # 添加超时机制
             response = self.client.generate(
                 model=self.model_name,
                 prompt=full_prompt,
-                options=self.generation_config
+                options=self.generation_config,
+                timeout=60  # 60秒超时
             )
             return response['response']
         except Exception as e:
             error_message = str(e)
+            print(f"Error generating text with {self.model_name}: {error_message}")
 
+        # 尝试其他模型作为回退
         for model in self.available_models:
             if model == self.model_name:
                 continue
             try:
+                print(f"Trying fallback model: {model}")
                 response = self.client.generate(
                     model=model,
                     prompt=full_prompt,
-                    options=self.generation_config
+                    options=self.generation_config,
+                    timeout=60
                 )
                 self.model_name = model
                 return response['response']
@@ -145,6 +180,87 @@ class CPUSettings:
                 p.cpu_affinity(self.cpu_cores)
             except Exception:
                 pass
+
+
+# ================== KNOWLEDGE BASE ==================
+class KnowledgeBase:
+    def __init__(self, cpu_settings):
+        self.vector_store = None
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        self.text_chunks = []
+        self.cpu_settings = cpu_settings
+
+    def import_data(self, file_paths):
+        if not file_paths:
+            return 0
+
+        documents = []
+        valid_paths = []
+
+        # 验证文件是否存在
+        for path in file_paths:
+            clean_path = path.strip()
+            if not os.path.exists(clean_path):
+                print(APP_STRINGS["file_not_found"].format(clean_path))
+                continue
+            valid_paths.append(clean_path)
+
+        if not valid_paths:
+            print(APP_STRINGS["no_valid_files"])
+            return 0
+
+        for path in valid_paths:
+            try:
+                if path.endswith('.txt'):
+                    loader = TextLoader(path, encoding='utf-8')
+                    docs = loader.load()
+                    if docs:
+                        print(f"Loaded {len(docs)} documents from {path}")
+                        documents.extend(docs)
+                elif path.endswith('.csv'):
+                    loader = CSVLoader(path)
+                    docs = loader.load()
+                    if docs:
+                        print(f"Loaded {len(docs)} documents from {path}")
+                        documents.extend(docs)
+            except Exception as e:
+                print(f"Error loading file {path}: {str(e)}")
+
+        if not documents:
+            print("No valid documents loaded")
+            return 0
+
+        chunks = []
+        for doc in documents:
+            try:
+                split_docs = self.text_splitter.split_documents([doc])
+                if split_docs:
+                    chunks.extend(split_docs)
+            except Exception as e:
+                print(f"Error splitting document: {str(e)}")
+
+        if not chunks:
+            print("No text chunks generated from documents")
+            return 0
+
+        self.text_chunks = [chunk.page_content for chunk in chunks]
+
+        try:
+            embeddings = OllamaEmbeddings(model="nomic-embed-text")
+            self.vector_store = FAISS.from_documents(chunks, embeddings)
+            print(APP_STRINGS["kb_imported"].format(len(chunks)))
+            return len(chunks)
+        except Exception as e:
+            print(f"Error creating vector store: {str(e)}")
+            return 0
+
+    def retrieve_context(self, query, k=5):
+        if not self.vector_store:
+            return []
+        return self.vector_store.similarity_search(query, k=k)
 
 
 # ================== TRAINING MONITOR ==================
@@ -207,65 +323,6 @@ class TrainingMonitor:
         plt.close(self.fig)
 
 
-# ================== KNOWLEDGE BASE ==================
-class KnowledgeBase:
-    def __init__(self, cpu_settings):
-        self.vector_store = None
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=200
-        )
-        self.text_chunks = []
-        self.cpu_settings = cpu_settings
-
-    def import_data(self, file_paths):
-        if not file_paths:
-            return 0
-
-        documents = []
-        for path in file_paths:
-            try:
-                if path.endswith('.txt'):
-                    loader = TextLoader(path, encoding='utf-8')
-                    docs = loader.load()
-                    if docs:
-                        documents.extend(docs)
-                elif path.endswith('.csv'):
-                    loader = CSVLoader(path)
-                    docs = loader.load()
-                    if docs:
-                        documents.extend(docs)
-            except Exception as e:
-                print(f"Error loading file {path}: {str(e)}")
-
-        if not documents:
-            return 0
-
-        chunks = []
-        for doc in documents:
-            try:
-                split_docs = self.text_splitter.split_documents([doc])
-                if split_docs:
-                    chunks.extend(split_docs)
-            except Exception as e:
-                print(f"Error splitting document: {str(e)}")
-
-        self.text_chunks = [chunk.page_content for chunk in chunks]
-
-        try:
-            embeddings = OllamaEmbeddings(model="nomic-embed-text")
-            self.vector_store = FAISS.from_documents(chunks, embeddings)
-            return len(chunks)
-        except Exception as e:
-            print(f"Error creating vector store: {str(e)}")
-            return 0
-
-    def retrieve_context(self, query, k=5):
-        if not self.vector_store:
-            return []
-        return self.vector_store.similarity_search(query, k=k)
-
-
 # ================== MODEL TRAINING ==================
 class ModelTrainer:
     def __init__(self, model_name, knowledge_base, cpu_settings, epochs=5):
@@ -284,6 +341,11 @@ class ModelTrainer:
 
             texts = self.knowledge_base.text_chunks
             labels = np.array([len(text) % 4 for text in texts], dtype=np.int64)
+
+            # 确保有足够的样本
+            if len(texts) < 10:
+                print(f"Insufficient data for training. Only {len(texts)} samples available.")
+                return None
 
             tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
             torch_dtype = torch.float16 if self.cpu_settings.use_half_precision else torch.float32
@@ -365,6 +427,8 @@ class ModelTrainer:
 
         except Exception as e:
             print(f"Training error: {str(e)}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def save_model(self, model, tokenizer):
@@ -387,9 +451,17 @@ class DeepLearningStudio:
 
     def check_ollama_service(self):
         try:
-            self.text_generator.client.list()
-            print(APP_STRINGS["ollama_running"])
-            return True
+            # 使用更可靠的检查方法
+            result = subprocess.run(["ollama", "serve", "--version"],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=10)
+            if result.returncode == 0:
+                print(APP_STRINGS["ollama_running"])
+                return True
+            else:
+                print(APP_STRINGS["ollama_stopped"])
+                return False
         except Exception:
             print(APP_STRINGS["ollama_stopped"])
             return False
@@ -413,19 +485,20 @@ class DeepLearningStudio:
 
     def import_knowledge(self, file_paths):
         if not file_paths:
+            print("No file paths provided")
             return False
 
         chunk_count = self.knowledge_base.import_data(file_paths)
-        if chunk_count > 0:
-            print(APP_STRINGS["kb_imported"].format(chunk_count))
-            return True
-        else:
-            print(APP_STRINGS["error_importing"])
-            return False
+        return chunk_count > 0
 
     def train_model(self, model_name, epochs=5):
         if not self.knowledge_base.vector_store:
             print(APP_STRINGS["no_kb_msg"])
+            return False
+
+        # 验证模型是否可用
+        if not self.text_generator.set_model(model_name):
+            print(f"Model '{model_name}' not available")
             return False
 
         trainer = ModelTrainer(model_name, self.knowledge_base, self.cpu_settings, epochs)
@@ -440,11 +513,16 @@ class DeepLearningStudio:
             print(f"Model '{model_name}' not available")
             return
 
+        if not self.text_generator.load_model():
+            print(f"Failed to load model '{model_name}'")
+            return
+
         context = None
         if self.knowledge_base.vector_store:
             context_chunks = self.knowledge_base.retrieve_context(prompt, k=3)
             context = "\n".join([c.page_content for c in context_chunks])
 
+        print(f"Generating response with {model_name}...")
         response = self.text_generator.generate_text(prompt, context)
         print("\n=== Model Response ===")
         print(response)
@@ -471,7 +549,10 @@ def main_menu(studio):
             paths = input("Enter file paths (comma separated): ").split(',')
             cleaned_paths = [p.strip() for p in paths if p.strip()]
             if cleaned_paths:
-                studio.import_knowledge(cleaned_paths)
+                if studio.import_knowledge(cleaned_paths):
+                    print("Data imported successfully")
+                else:
+                    print("Failed to import data")
             else:
                 print("No valid paths provided")
 
@@ -482,7 +563,12 @@ def main_menu(studio):
                     epochs = int(input("Number of epochs (default 5): ") or 5)
                 except ValueError:
                     epochs = 5
-                studio.train_model(model_name, epochs)
+
+                print(f"Starting training for {model_name}...")
+                if studio.train_model(model_name, epochs):
+                    print("Training completed successfully")
+                else:
+                    print("Training failed")
             else:
                 print("Model name required")
 
@@ -513,7 +599,11 @@ if __name__ == "__main__":
     studio = DeepLearningStudio()
 
     # Check Ollama status on startup
-    studio.check_ollama_service()
+    if not studio.check_ollama_service():
+        print("Warning: Ollama service is not running. Some features may not work.")
+
+    # Ensure models are scanned
+    studio.scan_local_models()
 
     # Start main menu
     main_menu(studio)
