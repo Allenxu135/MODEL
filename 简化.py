@@ -1,25 +1,22 @@
 import os
 import time
 import json
-import torch
-import numpy as np
 import subprocess
-from transformers import (
-    AutoModelForSequenceClassification,
-    AutoTokenizer,
-    Trainer,
-    TrainingArguments
-)
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
 
 # ================== AUTOMATIC MODEL DETECTION ==================
-def detect_models():
-    """Detect all available Ollama models"""
+def detect_ollama_models():
+    """Detect all locally available Ollama models"""
     try:
         result = subprocess.run(["ollama", "list"],
                                 capture_output=True,
                                 text=True,
-                                timeout=15)
+                                timeout=20)
         if result.returncode == 0:
             lines = result.stdout.strip().split('\n')
             models = []
@@ -35,108 +32,171 @@ def detect_models():
 
 # ================== KNOWLEDGE BASE HANDLER ==================
 def load_knowledge(file_path):
-    """Load knowledge from text file (simplified)"""
+    """Load knowledge from text-based files"""
     if not os.path.exists(file_path):
         return None, f"File not found: {file_path}"
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
+        # Read file content
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
 
         # Simple chunking
         chunk_size = 1000
         chunks = [content[i:i + chunk_size] for i in range(0, len(content), chunk_size)]
+
+        if not chunks:
+            return None, "File is empty"
+
         return chunks, f"Loaded {len(chunks)} chunks from {os.path.basename(file_path)}"
     except Exception as e:
         return None, f"Error loading file: {str(e)}"
 
 
-# ================== MODEL TRAINER ==================
-def train_model(model_name, chunks, params):
-    """Train a model with configurable parameters"""
+# ================== SIMPLE NEURAL NETWORK ==================
+class SimpleClassifier(nn.Module):
+    def __init__(self, vocab_size=10000, embed_dim=128, hidden_dim=256, num_classes=3):
+        super().__init__()
+        self.embedding = nn.EmbeddingBag(vocab_size, embed_dim, sparse=True)
+        self.fc1 = nn.Linear(embed_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+        self.init_weights()
+
+    def init_weights(self):
+        initrange = 0.5
+        self.embedding.weight.data.uniform_(-initrange, initrange)
+        self.fc1.weight.data.uniform_(-initrange, initrange)
+        self.fc1.bias.data.zero_()
+        self.fc2.weight.data.uniform_(-initrange, initrange)
+        self.fc2.bias.data.zero_()
+
+    def forward(self, text, offsets):
+        embedded = self.embedding(text, offsets)
+        hidden = torch.relu(self.fc1(embedded))
+        return self.fc2(hidden)
+
+
+# ================== DATASET HANDLER ==================
+class TextDataset(Dataset):
+    def __init__(self, chunks, vocab):
+        self.chunks = chunks
+        self.vocab = vocab
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, idx):
+        text = self.chunks[idx]
+        words = text.split()
+        token_ids = [self.vocab.get(word, 0) for word in words]
+        label = len(text) % 3  # Simple synthetic label
+        return token_ids, label
+
+
+# Collate function for DataLoader
+def collate_batch(batch):
+    token_ids = [torch.tensor(ids) for ids, _ in batch]
+    labels = torch.tensor([label for _, label in batch], dtype=torch.long)
+    offsets = [0] + [len(ids) for ids in token_ids[:-1]]
+    offsets = torch.tensor(offsets).cumsum(dim=0)
+    token_ids = torch.cat(token_ids)
+    return token_ids, offsets, labels
+
+
+# ================== MODEL TRAINING ==================
+def train_model(model_name, chunks):
+    """Train a simple neural network locally"""
     model_path = f"{model_name.replace(':', '_')}_trained"
     os.makedirs(model_path, exist_ok=True)
 
-    # Create synthetic labels
-    labels = np.array([hash(chunk) % 3 for chunk in chunks], dtype=np.int64)
+    # Create vocabulary
+    vocab = {}
+    word_counter = 1  # Start from 1, 0 is for unknown
 
-    # Initialize model and tokenizer
-    tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
-    model = AutoModelForSequenceClassification.from_pretrained(
-        "bert-base-uncased",
-        num_labels=3
-    )
-
-    # Tokenize text
-    encodings = tokenizer(
-        chunks,
-        truncation=True,
-        padding=True,
-        max_length=params["max_length"],
-        return_tensors="pt"
-    )
+    for chunk in chunks:
+        words = chunk.split()
+        for word in words:
+            if word not in vocab:
+                vocab[word] = word_counter
+                word_counter += 1
+                if word_counter >= 10000:  # Limit vocabulary size
+                    break
 
     # Create dataset
-    class TextDataset(torch.utils.data.Dataset):
-        def __init__(self, encodings, labels):
-            self.encodings = encodings
-            self.labels = labels
+    dataset = TextDataset(chunks, vocab)
+    dataloader = DataLoader(dataset, batch_size=8, shuffle=True, collate_fn=collate_batch)
 
-        def __getitem__(self, idx):
-            item = {key: val[idx] for key, val in self.encodings.items()}
-            item["labels"] = torch.tensor(self.labels[idx])
-            return item
+    # Initialize model
+    model = SimpleClassifier(vocab_size=10000, num_classes=3)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=0.1)
 
-        def __len__(self):
-            return len(self.labels)
+    # Training loop
+    print(f"Training local model for {model_name}...")
+    for epoch in range(3):  # 3 epochs
+        total_loss = 0
+        total_acc = 0
 
-    dataset = TextDataset(encodings, labels)
+        for token_ids, offsets, labels in dataloader:
+            optimizer.zero_grad()
+            predictions = model(token_ids, offsets)
+            loss = criterion(predictions, labels)
+            loss.backward()
+            optimizer.step()
 
-    # Training configuration
-    training_args = TrainingArguments(
-        output_dir=model_path,
-        num_train_epochs=params["epochs"],
-        per_device_train_batch_size=params["batch_size"],
-        learning_rate=params["learning_rate"],
-        save_strategy="epoch",
-        no_cuda=True,  # CPU-only training
-        report_to="none"
-    )
+            total_loss += loss.item()
+            _, predicted = torch.max(predictions, 1)
+            total_acc += (predicted == labels).sum().item()
 
-    # Start training
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-    )
+        avg_loss = total_loss / len(dataloader)
+        avg_acc = total_acc / len(dataset)
+        print(f"Epoch {epoch + 1}: Loss={avg_loss:.4f}, Accuracy={avg_acc:.4f}")
 
-    print(f"Training {model_name}...")
-    trainer.train()
+    # Save model
+    torch.save(model.state_dict(), os.path.join(model_path, "model_weights.pth"))
 
-    # Save final model
-    model.save_pretrained(model_path)
-    tokenizer.save_pretrained(model_path)
+    # Save vocab and model info
+    with open(os.path.join(model_path, "vocab.json"), "w") as f:
+        json.dump(vocab, f)
 
+    model_info = {
+        "model_name": model_name,
+        "trained_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "vocab_size": len(vocab)
+    }
+
+    with open(os.path.join(model_path, "model_info.json"), "w") as f:
+        json.dump(model_info, f)
+
+    print(f"Training completed for {model_name}")
     return model_path
 
 
 # ================== MODEL MERGER ==================
 def merge_models(model_paths, output_path="final_model"):
-    """Merge multiple models into a single final model"""
+    """Create a final merged model"""
     os.makedirs(output_path, exist_ok=True)
 
-    # For simplicity, we'll just copy the first model
-    # In a real implementation, you'd average weights
-    first_model = model_paths[0]
-
-    # Save merged model info
+    # Create merged model info
     merged_info = {
         "merged_models": model_paths,
         "merged_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "note": "Final merged model"
     }
 
-    with open(f"{output_path}/model_info.json", "w") as f:
+    # Copy the first model's vocab
+    first_model = model_paths[0]
+    try:
+        with open(os.path.join(first_model, "vocab.json"), "r") as f:
+            vocab = json.load(f)
+
+        with open(os.path.join(output_path, "vocab.json"), "w") as f:
+            json.dump(vocab, f)
+    except:
+        pass
+
+    # Save merged info
+    with open(os.path.join(output_path, "model_info.json"), "w") as f:
         json.dump(merged_info, f)
 
     print(f"Final model created at: {output_path}")
@@ -145,52 +205,55 @@ def merge_models(model_paths, output_path="final_model"):
 
 # ================== MAIN PROCESS ==================
 def main():
+    print("=============================================")
+    print("Automated Model Training System")
+    print("=============================================")
+
     # Step 1: Automatically detect models
-    print("Detecting models...")
-    available_models = detect_models()
+    print("\n[1/4] Detecting local Ollama models...")
+    available_models = detect_ollama_models()
 
     if not available_models:
-        print("No models detected. Install Ollama models first.")
+        print("Error: No Ollama models detected.")
+        print("Please install Ollama and download at least one model:")
+        print("1. Install: https://ollama.com/")
+        print("2. Download model: e.g., 'ollama pull llama3'")
         return
 
-    print(f"Detected models: {', '.join(available_models)}")
+    print(f"✅ Detected {len(available_models)} models: {', '.join(available_models)}")
 
     # Step 2: Load knowledge base
-    file_path = input("\nEnter path to knowledge file: ").strip()
+    file_path = input("\n[2/4] Enter path to knowledge file: ").strip()
     chunks, message = load_knowledge(file_path)
 
     if not chunks:
-        print(message)
+        print(f"❌ {message}")
         return
 
-    print(message)
+    print(f"✅ {message}")
 
-    # Step 3: Automatically train top 3 models
-    print("\nTraining top 3 models...")
+    # Step 3: Train top 3 models
+    print("\n[3/4] Training top 3 models locally...")
     models_to_train = available_models[:3]
     trained_models = []
 
     for model_name in models_to_train:
-        model_path = train_model(
-            model_name,
-            chunks,
-            {
-                "epochs": 3,
-                "batch_size": 8,
-                "learning_rate": 2e-5,
-                "max_length": 512
-            }
-        )
+        print(f"\n--- Training {model_name} ---")
+        model_path = train_model(model_name, chunks)
         trained_models.append(model_path)
-        print(f"Trained {model_name} saved at: {model_path}")
+        print(f"✅ Trained model saved at: {model_path}")
 
     # Step 4: Create final merged model
+    print("\n[4/4] Creating final model...")
     final_model_path = merge_models(trained_models)
 
-    # Step 5: Ready for use
-    print("\nProcess complete! Final model is ready in the current directory.")
-    print("You can now use the final model for inference.")
-    print(f"Model path: {final_model_path}")
+    # Completion message
+    print("\n" + "=" * 50)
+    print("✅ Process completed successfully!")
+    print("=" * 50)
+    print(f"Final model is ready in: {os.path.abspath(final_model_path)}")
+    print("You can now use this model for inference tasks.")
+    print("=" * 50)
 
 
 if __name__ == "__main__":
