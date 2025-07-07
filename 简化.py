@@ -62,7 +62,7 @@ class Config:
         print(f"Using GPT-2 tokenizer path: {self.gpt2_tokenizer_path}")
 
     def detect_gpt2_path(self, path_type):
-        """Intelligent GPT-2 path detection with priority scanning"""
+        """Intelligent GPT-2 path detection handling both files and directories"""
         # 1. Check environment variables
         env_var = f"GPT2_{path_type.upper()}_PATH"
         if env_var in os.environ:
@@ -79,14 +79,18 @@ class Config:
             f"/opt/gpt2/{path_type}",
             f"C:\\gpt2\\{path_type}",
             f"D:\\gpt2\\{path_type}",
-            f"E:\\gpt2\\{path_type}"
+            f"E:\\gpt2\\{path_type}",
+            "gpt2_model.bin",
+            "gpt2_tokenizer.bin",
+            "pytorch_model.bin",
+            "tokenizer.json"
         ]
 
         for path in common_paths:
             if self.is_valid_gpt2_path(path, path_type):
                 return path
 
-        # 3. Scan all drives for GPT-2 directories
+        # 3. Scan all drives for GPT-2 files
         scan_result = self.scan_drives_for_gpt2(path_type)
         if scan_result:
             return scan_result
@@ -98,7 +102,7 @@ class Config:
         return default_path
 
     def is_valid_gpt2_path(self, path, path_type):
-        """Validate if path contains GPT-2 files"""
+        """Validate if path is a valid GPT-2 file or directory"""
         if not os.path.exists(path):
             return False
 
@@ -106,18 +110,31 @@ class Config:
         model_files = {"pytorch_model.bin", "config.json"}
         tokenizer_files = {"tokenizer.json", "vocab.json", "merges.txt"}
 
-        if path_type == "model":
-            return all(f in os.listdir(path) for f in model_files)
-        else:  # tokenizer
-            return all(f in os.listdir(path) for f in tokenizer_files)
+        if os.path.isfile(path):
+            # Handle single file case
+            if path_type == "model":
+                return path.endswith((".bin", ".pt", ".pth", ".ckpt"))
+            else:  # tokenizer
+                return path.endswith((".json", ".txt", ".model"))
+        else:
+            # Handle directory case
+            dir_files = set(os.listdir(path))
+            if path_type == "model":
+                return model_files.issubset(dir_files)
+            else:  # tokenizer
+                return tokenizer_files.issubset(dir_files)
 
     def scan_drives_for_gpt2(self, path_type):
-        """Efficiently scan all drives for GPT-2 directories"""
+        """Efficiently scan all drives for GPT-2 files and directories"""
         # Get all drives
         drives = self.get_all_drives()
 
-        # Define search patterns
-        search_terms = ["gpt2", "gpt-2", "gpt_2", "transformers"]
+        # Define search patterns for both directories and files
+        dir_patterns = ["gpt2", "gpt-2", "gpt_2", "transformers"]
+        file_patterns = {
+            "model": ["pytorch_model.bin", "gpt2_model", ".bin", ".pt", ".pth", ".ckpt"],
+            "tokenizer": ["tokenizer.json", "vocab.json", "merges.txt", "tokenizer.model"]
+        }
 
         for drive in drives:
             print(f"Scanning {drive} for GPT-2 {path_type}...")
@@ -127,11 +144,19 @@ class Config:
                     if any(x in root.lower() for x in ["windows", "program files", "system32", "$recycle.bin"]):
                         continue
 
-                    # Check directory name for GPT-2 patterns
-                    if any(term in root.lower() for term in search_terms):
+                    # Check directories
+                    if any(term in root.lower() for term in dir_patterns):
                         if self.is_valid_gpt2_path(root, path_type):
-                            print(f"Found valid GPT-2 {path_type} at: {root}")
+                            print(f"Found valid GPT-2 {path_type} directory: {root}")
                             return root
+
+                    # Check individual files
+                    for file in files:
+                        if any(pattern in file.lower() for pattern in file_patterns[path_type]):
+                            file_path = os.path.join(root, file)
+                            if self.is_valid_gpt2_path(file_path, path_type):
+                                print(f"Found valid GPT-2 {path_type} file: {file_path}")
+                                return file_path
             except Exception as e:
                 print(f"Scan interrupted on {drive}: {str(e)}")
 
@@ -188,7 +213,18 @@ class KnowledgeBase:
 
         # Load tokenizer from detected path
         print(f"Loading tokenizer from: {config.gpt2_tokenizer_path}")
-        self.tokenizer = GPT2Tokenizer.from_pretrained(config.gpt2_tokenizer_path)
+
+        # Handle both file and directory paths
+        if os.path.isfile(config.gpt2_tokenizer_path):
+            # If it's a single file, load from file
+            self.tokenizer = GPT2Tokenizer.from_pretrained(
+                os.path.dirname(config.gpt2_tokenizer_path),
+                tokenizer_file=os.path.basename(config.gpt2_tokenizer_path)
+            )
+        else:
+            # If it's a directory
+            self.tokenizer = GPT2Tokenizer.from_pretrained(config.gpt2_tokenizer_path)
+
         self.tokenizer.pad_token = self.tokenizer.eos_token
         print("Tokenizer loaded successfully")
 
@@ -247,7 +283,17 @@ class DialogueModel(nn.Module):
 
         # Load GPT-2 model from detected path
         print(f"Loading GPT-2 model from: {config.gpt2_model_path}")
-        self.gpt2 = GPT2LMHeadModel.from_pretrained(config.gpt2_model_path)
+
+        # Handle both file and directory paths
+        if os.path.isfile(config.gpt2_model_path):
+            # If it's a single file, load using torch
+            model_state = torch.load(config.gpt2_model_path)
+            self.gpt2 = GPT2LMHeadModel.from_pretrained("gpt2")
+            self.gpt2.load_state_dict(model_state)
+        else:
+            # If it's a directory
+            self.gpt2 = GPT2LMHeadModel.from_pretrained(config.gpt2_model_path)
+
         self.gpt2.resize_token_embeddings(config.vocab_size)
         print("GPT-2 model loaded successfully")
 
