@@ -22,21 +22,24 @@ from torch.nn.utils.rnn import pad_sequence
 from torch.nn.utils import clip_grad_norm_
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
-from torch.cuda.amp import GradScaler, autocast
+from torch.cuda.amp import autocast
+
 
 # ========== CONFIGURATION ==========
 class Config:
     def __init__(self):
-        # Local model paths
+        # 本地模型路径
         self.gpt2_model_path = r"C:\Users\Administrator\gpt2"
         self.tokenizer_path = self.gpt2_model_path
-        self.ollama_host = "http://localhost:11434"
 
-        # Load tokenizer
+        # 修复: 使用127.0.0.1代替localhost避免IPv6问题
+        self.ollama_host = "http://127.0.0.1:11434"
+
+        # 加载分词器
         self.tokenizer = self.load_tokenizer()
         self.vocab_size = self.tokenizer.vocab_size
 
-        # Training parameters
+        # 训练参数
         self.chunk_size = 1000
         self.chunk_overlap = 200
         self.epochs = 5  # 增加训练轮数
@@ -51,30 +54,39 @@ class Config:
         self.dropout = 0.2  # 添加dropout防止过拟合
         self.weight_decay = 0.01  # 权重衰减
         self.max_grad_norm = 1.0  # 梯度裁剪
-        self.use_amp = True  # 启用自动混合精度
 
-        # Get available Ollama models
+        # 设备配置
+        self.cuda_available = torch.cuda.is_available()
+        self.gpu_weight = 1.0 if self.cuda_available else 0.0
+        self.cpu_weight = 0.0 if self.cuda_available else 1.0
+        self.auto_balance = False
+
+        # 自动混合精度 - 仅在CUDA可用时启用
+        self.use_amp = True if self.cuda_available else False
+
+        # 获取可用的Ollama模型
         self.available_models = self.get_available_ollama_models()
         if not self.available_models:
             raise RuntimeError("No Ollama models found. Please install at least one model.")
 
-        # Auto-select best models
+        # 自动选择最佳模型
         self.embedding_model = self.select_best_embedding_model()
         self.generation_models = self.select_generation_models()
 
-        # Device configuration
-        self.gpu_weight = 1.0
-        self.cpu_weight = 0.0
-        self.auto_balance = False
-
-        # Output configuration
+        # 输出配置
         self.final_model_dir = "final_dialogue_model"
         self.model_file = "dialogue_model.pth"
         self.save_every = 500
         self.log_every = 100
 
-        # Display configuration
+        # 显示配置
         print("\n=== DEEP LEARNING CONFIGURATION ===")
+        print(f"PyTorch Version: {torch.__version__}")
+        print(f"CUDA Available: {self.cuda_available}")
+        if self.cuda_available:
+            print(f"CUDA Version: {torch.version.cuda}")
+            print(f"GPU Device: {torch.cuda.get_device_name(0)}")
+        print(f"Using AMP: {self.use_amp}")
         print(f"GPT-2 Model Path: {self.gpt2_model_path}")
         print(f"Selected Embedding Model: {self.embedding_model}")
         print(f"Selected Generation Models: {', '.join(self.generation_models)}")
@@ -109,7 +121,8 @@ class Config:
     def get_available_ollama_models(self):
         """获取本地可用的Ollama模型列表"""
         try:
-            response = requests.get(f"{self.ollama_host}/api/tags")
+            # 修复: 增加超时时间避免连接失败
+            response = requests.get(f"{self.ollama_host}/api/tags", timeout=120)
             if response.status_code == 200:
                 models = response.json().get("models", [])
                 return [model["name"] for model in models]
@@ -140,18 +153,24 @@ class Config:
 
     def select_generation_models(self):
         """选择所有非嵌入模型作为生成模型"""
-        # 排除嵌入模型
+        # 排除嵌入模型和已知问题模型
+        skip_models = [self.embedding_model, "gemma3:4b", "gemma:4b"]
+
         generation_models = [
             model for model in self.available_models
-            if model != self.embedding_model
+            if model not in skip_models
         ]
 
         if not generation_models:
-            # 如果没有其他模型，使用所有模型
-            print("No non-embedding models found. Using all models for generation.")
+            # 如果没有其他模型，使用除问题模型外的所有模型
+            generation_models = [m for m in self.available_models if m not in skip_models]
+
+        if not generation_models:
+            # 最后尝试使用所有模型
+            print("No non-problematic models found. Using all models with risk.")
             return self.available_models
 
-        print(f"Selected {len(generation_models)} generation models for training data creation")
+        print(f"Selected {len(generation_models)} generation models: {', '.join(generation_models)}")
         return generation_models
 
 
@@ -376,29 +395,38 @@ class DialogueDataset(Dataset):
 
         print(f"Created {len(self.examples)} training examples from {len(knowledge_base.chunks)} chunks")
 
-    def generate_with_ollama(self, model_name, prompt):
-        """使用指定Ollama模型生成文本"""
-        try:
-            payload = {
-                "model": model_name,
-                "prompt": prompt,
-                "stream": False
-            }
-            response = requests.post(
-                f"{self.ollama_host}/api/generate",
-                json=payload,
-                timeout=60  # 增加超时时间
-            )
+    def generate_with_ollama(self, model_name, prompt, max_retries=2):
+        """使用指定Ollama模型生成文本，带重试机制"""
+        for attempt in range(max_retries + 1):
+            try:
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "stream": False
+                }
+                # 修复: 使用127.0.0.1代替localhost
+                response = requests.post(
+                    f"{self.ollama_host}/api/generate",
+                    json=payload,
+                    timeout=120  # 增加超时时间
+                )
 
-            if response.status_code == 200:
-                result = response.json()
-                return result.get("response", "").strip()
-            else:
-                print(f"Ollama API error ({model_name}): {response.status_code} - {response.text}")
-                return ""
-        except Exception as e:
-            print(f"Error generating with Ollama ({model_name}): {str(e)}")
-            return ""
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("response", "").strip()
+                else:
+                    print(f"Attempt {attempt + 1} failed: {response.status_code} - {response.text}")
+
+            except Exception as e:
+                print(f"Attempt {attempt + 1} error: {str(e)}")
+
+            # 重试前等待
+            if attempt < max_retries:
+                wait_time = 2 ** attempt  # 指数退避
+                print(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+
+        return ""  # 所有尝试失败后返回空字符串
 
     def __len__(self):
         return len(self.examples)
@@ -483,12 +511,34 @@ class ModelTrainer:
     def __init__(self, config, knowledge_base):
         self.config = config
         self.knowledge_base = knowledge_base
+
+        # 设备配置
+        if config.cuda_available and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            self.device = torch.device("cpu")
+            print("Using CPU")
+
         self.model = DialogueModel(config)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model.to(self.device)
 
-        # 自动混合精度
-        self.scaler = GradScaler(enabled=config.use_amp)
+        # 自动混合精度 - 使用新版本的初始化方式
+        if config.use_amp and torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler(
+                device_type='cuda',
+                enabled=True
+            )
+            print(f"Enabled Automatic Mixed Precision (AMP) - Using CUDA")
+        elif config.use_amp and not torch.cuda.is_available():
+            self.scaler = torch.amp.GradScaler(
+                device_type='cpu',
+                enabled=True
+            )
+            print(f"Enabled Automatic Mixed Precision (AMP) - Using CPU")
+        else:
+            self.scaler = None
+            print("Disabled Automatic Mixed Precision (AMP)")
 
         # 准备数据集
         dataset = DialogueDataset(knowledge_base, config)
@@ -540,20 +590,32 @@ class ModelTrainer:
             labels = batch["labels"].to(self.device, non_blocking=True)
             knowledge = batch["knowledge_ids"].to(self.device, non_blocking=True)
 
-            # 使用自动混合精度
-            with autocast(enabled=self.config.use_amp):
-                # 前向传播
+            # 使用自动混合精度 (如果启用)
+            if self.scaler is not None:
+                with autocast(enabled=self.config.use_amp):
+                    # 前向传播
+                    model_output = self.model(
+                        input_ids=inputs,
+                        attention_mask=masks,
+                        knowledge_ids=knowledge
+                    )
+
+                    # 计算损失
+                    shift_logits = model_output.logits[..., :-1, :].contiguous()
+                    shift_labels = labels[..., 1:].contiguous()
+                    loss = nn.CrossEntropyLoss(ignore_index=-100)(
+                        shift_logits.view(-1, shift_logits.size(-1)),
+                        shift_labels.view(-1)
+                    )
+            else:
+                # 不使用 AMP 的前向传播
                 model_output = self.model(
                     input_ids=inputs,
                     attention_mask=masks,
                     knowledge_ids=knowledge
                 )
-
-                # 计算损失
-                # 移位的logits和标签
                 shift_logits = model_output.logits[..., :-1, :].contiguous()
                 shift_labels = labels[..., 1:].contiguous()
-
                 loss = nn.CrossEntropyLoss(ignore_index=-100)(
                     shift_logits.view(-1, shift_logits.size(-1)),
                     shift_labels.view(-1)
@@ -561,15 +623,18 @@ class ModelTrainer:
 
             # 反向传播
             self.optimizer.zero_grad()
-            self.scaler.scale(loss).backward()
 
-            # 梯度裁剪
-            self.scaler.unscale_(self.optimizer)
-            clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+                self.scaler.unscale_(self.optimizer)
+                clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                loss.backward()
+                clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
+                self.optimizer.step()
 
-            # 更新参数
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
             self.scheduler.step()
 
             # 记录指标
@@ -606,13 +671,26 @@ class ModelTrainer:
                 knowledge = batch["knowledge_ids"].to(self.device)
 
                 # 使用自动混合精度
-                with autocast(enabled=self.config.use_amp):
+                if self.scaler is not None:
+                    with autocast(enabled=self.config.use_amp):
+                        model_output = self.model(
+                            input_ids=inputs,
+                            attention_mask=masks,
+                            knowledge_ids=knowledge
+                        )
+
+                        shift_logits = model_output.logits[..., :-1, :].contiguous()
+                        shift_labels = labels[..., 1:].contiguous()
+                        loss = nn.CrossEntropyLoss(ignore_index=-100)(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1)
+                        )
+                else:
                     model_output = self.model(
                         input_ids=inputs,
                         attention_mask=masks,
                         knowledge_ids=knowledge
                     )
-
                     shift_logits = model_output.logits[..., :-1, :].contiguous()
                     shift_labels = labels[..., 1:].contiguous()
                     loss = nn.CrossEntropyLoss(ignore_index=-100)(
@@ -633,6 +711,20 @@ class ModelTrainer:
         os.makedirs(self.config.final_model_dir, exist_ok=True)
         start_time = time.time()
         best_val_loss = float('inf')
+
+        # CUDA可用性验证
+        if self.config.cuda_available:
+            try:
+                test_tensor = torch.tensor([1.0]).cuda()
+                print("CUDA operation verification successful")
+            except Exception as e:
+                print(f"CUDA operation failed: {str(e)}")
+                print("Falling back to CPU mode")
+                self.device = torch.device("cpu")
+                self.model.to(self.device)
+                self.config.use_amp = False
+                if self.scaler:
+                    self.scaler = None
 
         for epoch in range(self.config.epochs):
             train_loss = self.train_epoch(epoch)
@@ -722,7 +814,8 @@ class ResourceMonitor:
         # 创建日志文件头
         if not os.path.exists(self.log_file):
             with open(self.log_file, "w") as f:
-                f.write("timestamp,cpu_usage(%),ram_usage(%),gpu_usage(%),gpu_mem(%)\n")
+                f.write(
+                    "timestamp,cpu_usage(%),ram_usage(%),gpu_usage(%),gpu_mem(%),ram_used(GB),ram_available(GB),gpu_mem_details\n")
 
     def start(self):
         self.active = True
@@ -741,27 +834,39 @@ class ResourceMonitor:
         cpu_percent = psutil.cpu_percent()
 
         # RAM使用率
-        ram_percent = psutil.virtual_memory().percent
+        ram = psutil.virtual_memory()
+        ram_percent = ram.percent
+        ram_used = ram.used / (1024 ** 3)  # 转换为GB
+        ram_available = ram.available / (1024 ** 3)  # 转换为GB
 
         # GPU使用率
         gpu_percent = 0
         gpu_mem_percent = 0
+        gpu_mem_details = ""
         try:
-            GPUs = GPUtil.getGPUs()
-            if GPUs:
-                gpu = GPUs[0]
+            gpus = GPUtil.getGPUs()
+            gpu_info = []
+            for i, gpu in enumerate(gpus):
                 gpu_percent = gpu.load * 100
                 gpu_mem_percent = gpu.memoryUtil * 100
+                gpu_info.append(f"GPU{i}: {gpu.memoryUsed:.1f}/{gpu.memoryTotal:.1f}MB ({gpu_mem_percent:.1f}%)")
+            gpu_mem_details = "; ".join(gpu_info)
         except Exception:
             pass
 
         # 写入日志
+        log_line = f"{timestamp},{cpu_percent},{ram_percent},{gpu_percent},{gpu_mem_percent},{ram_used:.2f},{ram_available:.2f},\"{gpu_mem_details}\""
+
         with open(self.log_file, "a") as f:
-            f.write(f"{timestamp},{cpu_percent},{ram_percent},{gpu_percent},{gpu_mem_percent}\n")
+            f.write(log_line + "\n")
+
+        print(
+            f"Resources: CPU {cpu_percent}%, RAM {ram_percent}% ({ram_used:.1f}/{ram.total / (1024 ** 3):.1f} GB), GPU {gpu_percent}%")
 
         return {
             "cpu": cpu_percent,
             "ram": ram_percent,
+            "ram_used": ram_used,
             "gpu": gpu_percent,
             "gpu_mem": gpu_mem_percent
         }
@@ -771,8 +876,15 @@ class ResourceMonitor:
 class DialogueEngine:
     def __init__(self, model_path, config, knowledge_base):
         self.config = config
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.knowledge_base = knowledge_base
+
+        # 设备选择
+        if config.cuda_available and torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
+        else:
+            self.device = torch.device("cpu")
+            print("Using CPU")
 
         # 加载模型
         self.model = DialogueModel(config)
@@ -805,12 +917,16 @@ class DialogueEngine:
             # 创建注意力掩码
             attention_mask = torch.ones(input_ids.shape, device=self.device)
 
-            # 获取知识嵌入
+            # 获取知识嵌入 (batch_size, seq_len, hidden_size)
             knowledge_embeds = self.model.embedding_layer(knowledge_tensor)
+
+            # 聚合知识 (平均池化)
             knowledge_embeds = knowledge_embeds.mean(dim=1, keepdim=True)
 
             # 深度知识融合
             fused_knowledge = self.model.knowledge_fusion(knowledge_embeds)
+
+            # 投影到GPT-2嵌入空间
             projected_knowledge = self.model.residual_projection(fused_knowledge)
 
             # 生成响应
