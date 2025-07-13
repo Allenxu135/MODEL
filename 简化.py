@@ -16,13 +16,13 @@ from collections import Counter
 from langchain_community.vectorstores import FAISS
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import TextLoader, DirectoryLoader
-from langchain_ollama import OllamaEmbeddings  # 更新后的导入路径
+from langchain_ollama import OllamaEmbeddings
 from torch.utils.data import Dataset, DataLoader, random_split
-from torch.nn.utils.rnn import pad_sequence, clip_grad_norm_
+from torch.nn.utils.rnn import pad_sequence
+from torch.nn.utils import clip_grad_norm_
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.cuda.amp import GradScaler, autocast
-
 
 # ========== CONFIGURATION ==========
 class Config:
