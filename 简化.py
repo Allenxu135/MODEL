@@ -23,16 +23,6 @@ from torch.nn.utils import clip_grad_norm_
 from transformers import GPT2Tokenizer, GPT2LMHeadModel, get_linear_schedule_with_warmup
 from torch.optim import AdamW
 from torch.cuda.amp import autocast
-import logging
-import traceback
-
-# 配置日志
-logging.basicConfig(
-    filename='dialogue_system.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 # ========== CONFIGURATION ==========
@@ -52,16 +42,16 @@ class Config:
         # 训练参数
         self.chunk_size = 1000
         self.chunk_overlap = 200
-        self.epochs = 3  # 减少训练轮数以加快测试
-        self.batch_size = 2  # 减小批大小以适应更复杂模型
+        self.epochs = 5  # 增加训练轮数
+        self.batch_size = 4  # 减小批大小以适应更复杂模型
         self.learning_rate = 3e-5  # 更精细的学习率
         self.max_seq_length = 384  # 增加序列长度
         self.rag_top_k = 5  # 增加检索上下文数量
 
         # 深度学习参数
-        self.hidden_size = 768  # 减小隐藏层大小以节省内存
-        self.num_layers = 2  # 减少知识融合层数
-        self.dropout = 0.1  # 添加dropout防止过拟合
+        self.hidden_size = 1024  # 增加隐藏层大小
+        self.num_layers = 4  # 增加知识融合层数
+        self.dropout = 0.2  # 添加dropout防止过拟合
         self.weight_decay = 0.01  # 权重衰减
         self.max_grad_norm = 1.0  # 梯度裁剪
 
@@ -137,10 +127,10 @@ class Config:
                 models = response.json().get("models", [])
                 return [model["name"] for model in models]
             else:
-                logger.error(f"Failed to get Ollama models: {response.status_code}")
+                print(f"Failed to get Ollama models: {response.status_code}")
                 return []
         except Exception as e:
-            logger.error(f"Error connecting to Ollama: {str(e)}")
+            print(f"Error connecting to Ollama: {str(e)}")
             return []
 
     def select_best_embedding_model(self):
@@ -148,17 +138,17 @@ class Config:
         # 优先选择nomic-embed-text
         for model in self.available_models:
             if "nomic-embed-text" in model:
-                logger.info(f"Auto-selected embedding model: {model}")
+                print(f"Auto-selected embedding model: {model}")
                 return model
 
         # 如果没有nomic，选择其他嵌入模型
         for model in self.available_models:
             if "embed" in model or "bge" in model:
-                logger.info(f"Selected embedding model: {model}")
+                print(f"Selected embedding model: {model}")
                 return model
 
         # 如果都没有，使用第一个模型
-        logger.info(f"Using first available model for embedding: {self.available_models[0]}")
+        print(f"Using first available model for embedding: {self.available_models[0]}")
         return self.available_models[0]
 
     def select_generation_models(self):
@@ -177,10 +167,10 @@ class Config:
 
         if not generation_models:
             # 最后尝试使用所有模型
-            logger.warning("No non-problematic models found. Using all models with risk.")
+            print("No non-problematic models found. Using all models with risk.")
             return self.available_models
 
-        logger.info(f"Selected {len(generation_models)} generation models: {', '.join(generation_models)}")
+        print(f"Selected {len(generation_models)} generation models: {', '.join(generation_models)}")
         return generation_models
 
 
@@ -191,14 +181,12 @@ class KnowledgeBase:
         self.vector_store = None
         self.log_file = "knowledge_errors.log"
         self.chunks = []
-        self.loaded_files = []
 
     def log_error(self, message):
         """带时间戳记录错误"""
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open(self.log_file, "a", encoding='utf-8') as f:
+        with open(self.log_file, "a") as f:
             f.write(f"[{timestamp}] {message}\n")
-        logger.error(message)
 
     def load_files(self, path):
         """从目录或文件加载知识"""
@@ -210,106 +198,32 @@ class KnowledgeBase:
         try:
             # 处理目录
             if os.path.isdir(path):
-                logger.info(f"Loading directory: {path}")
-                success = self.load_directory(path)
+                print(f"Loading directory: {path}")
+                loader = DirectoryLoader(path, glob="**/*.txt", loader_cls=TextLoader)
+                documents = loader.load()
                 desc = f"directory '{os.path.basename(path)}'"
-                return success, f"Loaded directory with {len(self.chunks)} chunks"
 
             # 处理单个文件
             elif os.path.isfile(path) and path.lower().endswith('.txt'):
-                logger.info(f"Loading single file: {path}")
-                success = self.load_single_file(path)
+                print(f"Loading single file: {path}")
+                # 检测文件编码
+                with open(path, 'rb') as f:
+                    raw_data = f.read(10000)
+                    result = chardet.detect(raw_data)
+                    encoding = result['encoding'] or 'utf-8'
+
+                print(f"Using encoding: {encoding}")
+                loader = TextLoader(path, encoding=encoding)
+                documents = loader.load()
                 desc = f"file '{os.path.basename(path)}'"
-                return success, f"Loaded file with {len(self.chunks)} chunks"
 
             else:
                 error = "Only directories or .txt files supported"
                 self.log_error(error)
                 return False, error
 
-        except Exception as e:
-            error = f"Error loading files: {str(e)}"
-            self.log_error(error)
-            return False, error
-
-    def load_directory(self, directory_path):
-        """加载目录中的所有文本文件"""
-        self.chunks = []
-        self.loaded_files = []
-
-        # 获取所有.txt文件
-        txt_files = []
-        for root, _, files in os.walk(directory_path):
-            for file in files:
-                if file.lower().endswith('.txt'):
-                    txt_files.append(os.path.join(root, file))
-
-        if not txt_files:
-            logger.warning(f"No .txt files found in directory: {directory_path}")
-            return False
-
-        logger.info(f"Found {len(txt_files)} .txt files in directory")
-
-        # 逐个加载文件
-        for file_path in txt_files:
-            try:
-                self.load_single_file(file_path)
-                self.loaded_files.append(file_path)
-            except Exception as e:
-                logger.error(f"Error loading file {file_path}: {str(e)}")
-                continue
-
-        if not self.chunks:
-            logger.error("No valid chunks created from directory")
-            return False
-
-        # 创建向量存储
-        logger.info(f"Creating vector store with {self.config.embedding_model}...")
-        embeddings = OllamaEmbeddings(model=self.config.embedding_model)
-        self.vector_store = FAISS.from_texts(self.chunks, embeddings)
-        logger.info("Vector store created successfully")
-        return True
-
-    def load_single_file(self, file_path):
-        """加载单个文本文件"""
-        # 检测文件编码
-        with open(file_path, 'rb') as f:
-            raw_data = f.read()
-
-            # 如果文件为空，跳过
-            if len(raw_data) == 0:
-                logger.warning(f"Skipping empty file: {file_path}")
-                return False
-
-            result = chardet.detect(raw_data)
-            encoding = result['encoding'] or 'utf-8'
-            confidence = result['confidence']
-
-            # 如果置信度低，尝试常见编码
-            if confidence < 0.7:
-                for test_encoding in ['utf-8', 'gbk', 'latin-1', 'iso-8859-1']:
-                    try:
-                        content = raw_data.decode(test_encoding, errors='strict')
-                        encoding = test_encoding
-                        logger.info(f"Using fallback encoding {test_encoding} for {file_path}")
-                        break
-                    except UnicodeDecodeError:
-                        continue
-
-        logger.info(f"Using encoding: {encoding} for {file_path}")
-
-        try:
-            # 尝试解码内容
-            content = raw_data.decode(encoding, errors='replace')
-
-            # 如果内容为空，跳过
-            if not content.strip():
-                logger.warning(f"Skipping empty content file: {file_path}")
-                return False
-
-            # 使用TextLoader处理内容
-            loader = TextLoader(file_path, encoding=encoding)
-            document = loader.load()[0].page_content
+            # 从文档中提取内容
+            contents = [doc.page_content for doc in documents]
 
             # 将文本分割成块
             splitter = RecursiveCharacterTextSplitter(
@@ -317,14 +231,27 @@ class KnowledgeBase:
                 chunk_overlap=self.config.chunk_overlap
             )
 
-            chunks = splitter.split_text(document)
-            self.chunks.extend(chunks)
-            logger.info(f"Created {len(chunks)} chunks from {file_path}")
-            return True
+            # 通过分割每个文档创建块
+            all_chunks = []
+            for content in contents:
+                chunks = splitter.split_text(content)
+                all_chunks.extend(chunks)
+
+            self.chunks = all_chunks
+            print(f"Created {len(self.chunks)} chunks from {len(contents)} documents")
+
+            # 创建向量存储
+            print(f"Creating vector store with {self.config.embedding_model}...")
+            embeddings = OllamaEmbeddings(model=self.config.embedding_model)
+            self.vector_store = FAISS.from_texts(self.chunks, embeddings)
+            print("Vector store created successfully")
+
+            return True, f"Loaded {len(self.chunks)} chunks from {desc}"
 
         except Exception as e:
-            logger.error(f"Error processing file {file_path}: {str(e)}")
-            return False
+            error = f"Error loading files: {str(e)}"
+            self.log_error(error)
+            return False, error
 
     def retrieve_context(self, query, k=None):
         """使用RAG检索相关上下文"""
@@ -332,17 +259,13 @@ class KnowledgeBase:
             k = self.config.rag_top_k
 
         if not self.vector_store:
-            logger.warning("Vector store not initialized")
             return ""
 
         try:
             results = self.vector_store.similarity_search(query, k=k)
-            context = "\n\n".join([doc.page_content for doc in results])
-            logger.info(f"Retrieved context: {context[:100]}...")
-            return context
+            return "\n\n".join([doc.page_content for doc in results])
         except Exception as e:
-            error = f"Retrieval error: {str(e)}"
-            self.log_error(error)
+            self.log_error(f"Retrieval error: {str(e)}")
             return ""
 
 
@@ -385,10 +308,10 @@ class DialogueModel(nn.Module):
         self.config = config
 
         # 加载GPT-2模型作为对话生成核心
-        logger.info(f"Loading GPT-2 model from: {config.gpt2_model_path}")
+        print(f"Loading GPT-2 model from: {config.gpt2_model_path}")
         self.gpt2 = GPT2LMHeadModel.from_pretrained(config.gpt2_model_path)
         self.gpt2.resize_token_embeddings(config.vocab_size)
-        logger.info("GPT-2 model loaded successfully")
+        print("GPT-2 model loaded successfully")
 
         # 初始化知识token的嵌入层
         self.embedding_layer = self.gpt2.transformer.wte
@@ -430,34 +353,6 @@ class DialogueModel(nn.Module):
             attention_mask=attention_mask
         )
 
-    def generate(self, input_ids, attention_mask=None, knowledge_ids=None, **kwargs):
-        """自定义生成方法"""
-        # 将token IDs转换为嵌入向量
-        inputs_embeds = self.embedding_layer(input_ids)
-
-        if knowledge_ids is not None:
-            # 获取知识嵌入
-            knowledge_embeds = self.embedding_layer(knowledge_ids)
-
-            # 聚合知识
-            knowledge_embeds = knowledge_embeds.mean(dim=1, keepdim=True)
-
-            # 深度知识融合
-            fused_knowledge = self.knowledge_fusion(knowledge_embeds)
-
-            # 投影到GPT-2嵌入空间
-            projected_knowledge = self.residual_projection(fused_knowledge)
-
-            # 将知识与输入嵌入融合
-            inputs_embeds = inputs_embeds + projected_knowledge
-
-        # 通过GPT-2模型生成响应
-        return self.gpt2.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            **kwargs
-        )
-
 
 # ========== DATASET ==========
 class DialogueDataset(Dataset):
@@ -468,27 +363,70 @@ class DialogueDataset(Dataset):
         self.ollama_host = config.ollama_host
         self.generation_models = config.generation_models
 
-        # 直接从知识块创建简单训练样本
-        logger.info(f"Creating training examples from {len(knowledge_base.chunks)} chunks...")
-        for chunk in knowledge_base.chunks:
-            # 创建简单的问答对
-            question = f"Tell me about {chunk[:50].strip()}..."
-            answer = chunk[:200].strip()
+        # 使用所有Ollama生成模型从知识块创建训练样本
+        print(f"Generating training examples with {len(self.generation_models)} Ollama models...")
+        for chunk_idx, chunk in enumerate(tqdm.tqdm(knowledge_base.chunks, desc="Processing chunks")):
+            # 为每个生成模型创建训练样本
+            for model_name in self.generation_models:
+                try:
+                    # 使用当前生成模型生成问题和答案
+                    question = self.generate_with_ollama(
+                        model_name,
+                        f"Create a concise question about: {chunk[:100]}"
+                    )
+                    answer = self.generate_with_ollama(
+                        model_name,
+                        f"Provide a detailed answer to: {question} based on this context: {chunk[:500]}"
+                    )
 
-            self.examples.append({
-                "input": question,
-                "output": answer,
-                "knowledge": chunk
-            })
+                    # 确保生成了有效内容
+                    if not question or not answer:
+                        question = f"Explain: {chunk[:50]}..."
+                        answer = f"According to the knowledge: {chunk[:200]}"
 
-        logger.info(f"Created {len(self.examples)} training examples")
+                    self.examples.append({
+                        "input": question,
+                        "output": answer,
+                        "knowledge": chunk,
+                        "model": model_name
+                    })
+                except Exception as e:
+                    print(f"Error generating example with {model_name} for chunk {chunk_idx}: {str(e)}")
 
-        # 保存示例到文件用于调试
-        try:
-            with open("training_examples.json", "w", encoding='utf-8') as f:
-                json.dump(self.examples[:min(10, len(self.examples))], f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error saving training examples: {str(e)}")
+        print(f"Created {len(self.examples)} training examples from {len(knowledge_base.chunks)} chunks")
+
+    def generate_with_ollama(self, model_name, prompt, max_retries=2):
+        """使用指定Ollama模型生成文本，带重试机制"""
+        for attempt in range(max_retries + 1):
+            try:
+                payload = {
+                    "model": model_name,
+                    "prompt": prompt,
+                    "stream": False
+                }
+                # 修复: 使用127.0.0.1代替localhost
+                response = requests.post(
+                    f"{self.ollama_host}/api/generate",
+                    json=payload,
+                    timeout=120  # 增加超时时间
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    return result.get("response", "").strip()
+                else:
+                    print(f"Attempt {attempt + 1} failed: {response.status_code} - {response.text}")
+
+            except Exception as e:
+                print(f"Attempt {attempt + 1} error: {str(e)}")
+
+            # 重试前等待
+            if attempt < max_retries:
+                wait_time = 2 ** attempt  # 指数退避
+                print(f"Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+
+        return ""  # 所有尝试失败后返回空字符串
 
     def __len__(self):
         return len(self.examples)
@@ -577,10 +515,10 @@ class ModelTrainer:
         # 设备配置
         if config.cuda_available and torch.cuda.is_available():
             self.device = torch.device("cuda")
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         else:
             self.device = torch.device("cpu")
-            logger.info("Using CPU")
+            print("Using CPU")
 
         self.model = DialogueModel(config)
         self.model.to(self.device)
@@ -591,16 +529,16 @@ class ModelTrainer:
                 device_type='cuda',
                 enabled=True
             )
-            logger.info(f"Enabled Automatic Mixed Precision (AMP) - Using CUDA")
+            print(f"Enabled Automatic Mixed Precision (AMP) - Using CUDA")
         elif config.use_amp and not torch.cuda.is_available():
             self.scaler = torch.amp.GradScaler(
                 device_type='cpu',
                 enabled=True
             )
-            logger.info(f"Enabled Automatic Mixed Precision (AMP) - Using CPU")
+            print(f"Enabled Automatic Mixed Precision (AMP) - Using CPU")
         else:
             self.scaler = None
-            logger.info("Disabled Automatic Mixed Precision (AMP)")
+            print("Disabled Automatic Mixed Precision (AMP)")
 
         # 准备数据集
         dataset = DialogueDataset(knowledge_base, config)
@@ -611,12 +549,12 @@ class ModelTrainer:
         self.train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size,
             shuffle=True, collate_fn=collate_fn,
-            pin_memory=True, num_workers=0  # 减少工作线程数
+            pin_memory=True, num_workers=4
         )
         self.val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size,
             collate_fn=collate_fn,
-            pin_memory=True, num_workers=0  # 减少工作线程数
+            pin_memory=True, num_workers=2
         )
 
         # 优化器和调度器
@@ -712,10 +650,10 @@ class ModelTrainer:
 
             if (batch_idx + 1) % self.config.log_every == 0:
                 self.resource_monitor.log_resources()
-                logger.info(f"Batch {batch_idx + 1} Loss: {loss.item():.4f}, LR: {current_lr:.2e}")
+                print(f"Batch {batch_idx + 1} Loss: {loss.item():.4f}, LR: {current_lr:.2e}")
 
         avg_loss = total_loss / batch_count
-        logger.info(f"Epoch {epoch + 1} Train Loss: {avg_loss:.4f}")
+        print(f"Epoch {epoch + 1} Train Loss: {avg_loss:.4f}")
         self.resource_monitor.stop()
         return avg_loss
 
@@ -765,7 +703,7 @@ class ModelTrainer:
 
         avg_loss = total_loss / batch_count
         self.val_loss_history.append(avg_loss)
-        logger.info(f"Validation Loss: {avg_loss:.4f}")
+        print(f"Validation Loss: {avg_loss:.4f}")
         self.resource_monitor.stop()
         return avg_loss
 
@@ -778,10 +716,10 @@ class ModelTrainer:
         if self.config.cuda_available:
             try:
                 test_tensor = torch.tensor([1.0]).cuda()
-                logger.info("CUDA operation verification successful")
+                print("CUDA operation verification successful")
             except Exception as e:
-                logger.error(f"CUDA operation failed: {str(e)}")
-                logger.info("Falling back to CPU mode")
+                print(f"CUDA operation failed: {str(e)}")
+                print("Falling back to CPU mode")
                 self.device = torch.device("cpu")
                 self.model.to(self.device)
                 self.config.use_amp = False
@@ -795,10 +733,10 @@ class ModelTrainer:
             # 保存最佳模型
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                self.save_model("best")
+                self.save_model("best_model")
 
         # 保存最终模型
-        self.save_model("final")
+        self.save_model("final_model")
         training_time = time.time() - start_time
 
         # 保存训练元数据
@@ -812,15 +750,11 @@ class ModelTrainer:
             "embedding_model": self.config.embedding_model,
             "generation_models": self.config.generation_models,
             "gpt2_model": self.config.gpt2_model_path,
-            "best_val_loss": best_val_loss,
-            "knowledge_files": self.knowledge_base.loaded_files
+            "best_val_loss": best_val_loss
         }
 
-        try:
-            with open(os.path.join(self.config.final_model_dir, "metadata.json"), "w", encoding='utf-8') as f:
-                json.dump(metadata, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            logger.error(f"Error saving metadata: {str(e)}")
+        with open(os.path.join(self.config.final_model_dir, "metadata.json"), "w") as f:
+            json.dump(metadata, f, indent=2)
 
         # 绘制训练损失图
         self.plot_training_loss()
@@ -829,27 +763,15 @@ class ModelTrainer:
 
     def save_model(self, prefix):
         model_path = os.path.join(self.config.final_model_dir, f"{prefix}_{self.config.model_file}")
-        try:
-            torch.save({
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'scheduler_state_dict': self.scheduler.state_dict(),
-                'loss_history': self.loss_history,
-                'val_loss_history': self.val_loss_history,
-                'config': self.config.__dict__
-            }, model_path)
-            logger.info(f"Saved model to: {model_path}")
-        except Exception as e:
-            logger.error(f"Error saving model: {str(e)}")
-
-        # 同时保存最终模型的标准名称
-        if prefix == "final":
-            final_path = os.path.join(self.config.final_model_dir, "final_model.pth")
-            try:
-                torch.save(self.model.state_dict(), final_path)
-                logger.info(f"Saved final model to: {final_path}")
-            except Exception as e:
-                logger.error(f"Error saving final model: {str(e)}")
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'loss_history': self.loss_history,
+            'val_loss_history': self.val_loss_history,
+            'config': self.config.__dict__
+        }, model_path)
+        print(f"Saved model to: {model_path}")
 
     def plot_training_loss(self):
         if not self.loss_history or not self.val_loss_history:
@@ -877,12 +799,9 @@ class ModelTrainer:
 
         plt.tight_layout()
         plot_path = os.path.join(self.config.final_model_dir, "training_metrics.png")
-        try:
-            plt.savefig(plot_path)
-            plt.close()
-            logger.info(f"Saved training plot to: {plot_path}")
-        except Exception as e:
-            logger.error(f"Error saving training plot: {str(e)}")
+        plt.savefig(plot_path)
+        plt.close()
+        print(f"Saved training plot to: {plot_path}")
 
 
 # ========== RESOURCE MONITOR ==========
@@ -894,12 +813,9 @@ class ResourceMonitor:
 
         # 创建日志文件头
         if not os.path.exists(self.log_file):
-            try:
-                with open(self.log_file, "w", encoding='utf-8') as f:
-                    f.write(
-                        "timestamp,cpu_usage(%),ram_usage(%),gpu_usage(%),gpu_mem(%),ram_used(GB),ram_available(GB),gpu_mem_details\n")
-            except Exception as e:
-                logger.error(f"Error creating resource log: {str(e)}")
+            with open(self.log_file, "w") as f:
+                f.write(
+                    "timestamp,cpu_usage(%),ram_usage(%),gpu_usage(%),gpu_mem(%),ram_used(GB),ram_available(GB),gpu_mem_details\n")
 
     def start(self):
         self.active = True
@@ -935,19 +851,16 @@ class ResourceMonitor:
                 gpu_mem_percent = gpu.memoryUtil * 100
                 gpu_info.append(f"GPU{i}: {gpu.memoryUsed:.1f}/{gpu.memoryTotal:.1f}MB ({gpu_mem_percent:.1f}%)")
             gpu_mem_details = "; ".join(gpu_info)
-        except Exception as e:
-            logger.error(f"GPU monitoring error: {str(e)}")
+        except Exception:
+            pass
 
         # 写入日志
         log_line = f"{timestamp},{cpu_percent},{ram_percent},{gpu_percent},{gpu_mem_percent},{ram_used:.2f},{ram_available:.2f},\"{gpu_mem_details}\""
 
-        try:
-            with open(self.log_file, "a", encoding='utf-8') as f:
-                f.write(log_line + "\n")
-        except Exception as e:
-            logger.error(f"Error writing resource log: {str(e)}")
+        with open(self.log_file, "a") as f:
+            f.write(log_line + "\n")
 
-        logger.info(
+        print(
             f"Resources: CPU {cpu_percent}%, RAM {ram_percent}% ({ram_used:.1f}/{ram.total / (1024 ** 3):.1f} GB), GPU {gpu_percent}%")
 
         return {
@@ -964,151 +877,110 @@ class DialogueEngine:
     def __init__(self, model_path, config, knowledge_base):
         self.config = config
         self.knowledge_base = knowledge_base
-        self.model_path = model_path
 
         # 设备选择
         if config.cuda_available and torch.cuda.is_available():
             self.device = torch.device("cuda")
-            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
         else:
             self.device = torch.device("cpu")
-            logger.info("Using CPU")
+            print("Using CPU")
 
         # 加载模型
         self.model = DialogueModel(config)
-
-        # 检查文件是否存在
-        possible_paths = [
-            model_path,
-            os.path.join(os.path.dirname(model_path), "final_model.pth"),
-            os.path.join(os.path.dirname(model_path), "best_dialogue_model.pth"),
-            os.path.join(os.path.dirname(model_path), "final_dialogue_model.pth")
-        ]
-
-        loaded = False
-        for path in possible_paths:
-            if os.path.exists(path):
-                try:
-                    # 加载模型状态字典
-                    state_dict = torch.load(path, map_location=self.device)
-                    if 'model_state_dict' in state_dict:
-                        self.model.load_state_dict(state_dict['model_state_dict'])
-                    else:
-                        self.model.load_state_dict(state_dict)
-
-                    self.model.to(self.device)
-                    self.model.eval()
-                    logger.info(f"Model loaded successfully from: {path}")
-                    loaded = True
-                    self.model_path = path
-                    break
-                except Exception as e:
-                    logger.error(f"Error loading model from {path}: {str(e)}")
-
-        if not loaded:
-            raise FileNotFoundError(f"No valid model found in possible paths: {possible_paths}")
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.to(self.device)
+        self.model.eval()
 
         # 加载tokenizer
         self.tokenizer = config.tokenizer
 
     def generate_response(self, query, max_length=150, temperature=0.7, top_p=0.9, top_k=50):
-        try:
-            # 检索相关知识
-            context = self.knowledge_base.retrieve_context(query)
-            logger.info(f"Retrieved context length: {len(context)} characters")
+        # 检索相关知识
+        context = self.knowledge_base.retrieve_context(query)
 
-            # 将上下文编码为知识ID
-            knowledge_ids = self.tokenizer.encode(
-                context,
-                max_length=self.config.max_seq_length,
-                truncation=True,
-                add_special_tokens=False
-            )
-            knowledge_tensor = torch.tensor([knowledge_ids], dtype=torch.long).to(self.device)
+        # 将上下文编码为知识ID
+        knowledge_ids = self.tokenizer.encode(
+            context,
+            max_length=self.config.max_seq_length,
+            truncation=True,
+            add_special_tokens=False
+        )
+        knowledge_tensor = torch.tensor([knowledge_ids], dtype=torch.long).to(self.device)
 
-            # 编码查询
-            input_ids = self.tokenizer.encode(
-                query,
-                return_tensors="pt",
-                add_special_tokens=False
-            ).to(self.device)
+        # 编码查询
+        input_ids = self.tokenizer.encode(query, return_tensors="pt", add_special_tokens=False).to(self.device)
 
+        # 使用知识生成响应
+        with torch.no_grad():
             # 创建注意力掩码
             attention_mask = torch.ones(input_ids.shape, device=self.device)
 
-            # 使用自定义模型生成响应
-            with torch.no_grad():
-                output = self.model.generate(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                    knowledge_ids=knowledge_tensor,
-                    max_length=max_length,
-                    temperature=temperature,
-                    top_p=top_p,
-                    top_k=top_k,
-                    do_sample=True,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    num_return_sequences=1
-                )
+            # 获取知识嵌入 (batch_size, seq_len, hidden_size)
+            knowledge_embeds = self.model.embedding_layer(knowledge_tensor)
 
-            # 解码响应
-            response = self.tokenizer.decode(output[0], skip_special_tokens=True)
+            # 聚合知识 (平均池化)
+            knowledge_embeds = knowledge_embeds.mean(dim=1, keepdim=True)
 
-            # 移除查询部分（如果存在）
-            if response.startswith(query):
-                response = response[len(query):].strip()
+            # 深度知识融合
+            fused_knowledge = self.model.knowledge_fusion(knowledge_embeds)
 
-            return response
-        except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
-            return "I encountered an error while generating a response. Please try again."
+            # 投影到GPT-2嵌入空间
+            projected_knowledge = self.model.residual_projection(fused_knowledge)
+
+            # 生成响应
+            output = self.model.gpt2.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                inputs_embeds=self.model.embedding_layer(input_ids) + projected_knowledge,
+                max_length=max_length,
+                temperature=temperature,
+                top_p=top_p,
+                top_k=top_k,
+                do_sample=True,
+                pad_token_id=self.tokenizer.eos_token_id,
+                eos_token_id=self.tokenizer.eos_token_id,
+                num_return_sequences=1
+            )
+
+        # 解码响应
+        response = self.tokenizer.decode(output[0], skip_special_tokens=True)
+        return response[len(query):].strip() if response.startswith(query) else response
 
 
 # ========== MAIN ==========
 def main():
     try:
         # 初始化配置
-        logger.info("Initializing configuration...")
         config = Config()
 
         # 步骤1: 加载知识库
-        logger.info("\n[1/4] Loading knowledge base...")
-        default_path = "knowledge_base"
+        print("\n[1/4] Loading knowledge base...")
         path = input(
-            f"Enter path to knowledge directory or file (press Enter for '{default_path}'): ").strip() or default_path
-
-        # 修复Windows路径问题
-        path = path.replace("/", "\\")
-
-        logger.info(f"Using knowledge path: {path}")
+            "Enter path to knowledge directory or file (press Enter for 'knowledge_base'): ").strip() or "knowledge_base"
         knowledge_base = KnowledgeBase(config)
         success, message = knowledge_base.load_files(path)
 
         if not success:
-            logger.error(f"Error: {message}")
             print(f"Error: {message}")
             print(f"Check error log: {knowledge_base.log_file}")
             return
 
-        logger.info(f"Success: {message}")
         print(f"Success: {message}")
 
         # 步骤2: 训练模型
-        logger.info("\n[2/4] Training dialogue model...")
+        print("\n[2/4] Training dialogue model...")
         trainer = ModelTrainer(config, knowledge_base)
         model_dir = trainer.train()
 
         # 步骤3: 初始化对话引擎
-        logger.info("\n[3/4] Initializing dialogue engine...")
-        # 使用标准模型文件名
-        model_path = os.path.join(model_dir, "final_model.pth")
+        print("\n[3/4] Initializing dialogue engine...")
+        model_path = os.path.join(model_dir, "final_model_dialogue_model.pth")
         engine = DialogueEngine(model_path, config, knowledge_base)
-        logger.info("Dialogue engine ready")
         print("Dialogue engine ready")
 
         # 步骤4: 交互式对话
-        logger.info("\n[4/4] Starting conversation")
         print("\n[4/4] Starting conversation (type 'exit' to quit)")
         while True:
             try:
@@ -1136,12 +1008,10 @@ def main():
                 break
             except Exception as e:
                 print(f"Error: {str(e)}")
-                logger.error(f"Conversation error: {str(e)}")
     except Exception as e:
-        error_msg = f"Fatal error: {str(e)}"
-        print(error_msg)
-        logger.error(error_msg)
-        logger.error(traceback.format_exc())
+        print(f"Fatal error: {str(e)}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
