@@ -21,6 +21,10 @@ import torch.nn as nn
 import docx
 import csv
 import GPUtil
+import subprocess
+import faiss
+import multiprocessing
+from concurrent.futures import ThreadPoolExecutor
 
 # Force CUDA usage
 torch.backends.cudnn.benchmark = True
@@ -51,6 +55,14 @@ class MedicalConfig:
         self.device = torch.device("cuda" if self.cuda_available else "cpu")
         print(f"Using device: {self.device}")
 
+        # Set Faiss to use CPU-GPU hybrid mode
+        self.faiss_gpu = True if torch.cuda.is_available() else False
+        if self.faiss_gpu:
+            print("Enabling Faiss GPU acceleration")
+            self.faiss_res = faiss.StandardGpuResources()
+        else:
+            print("Using Faiss CPU only")
+
         if self.cuda_available:
             print(f"CUDA device: {torch.cuda.get_device_name(0)}")
             print(f"CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1024 ** 3:.2f} GB")
@@ -77,7 +89,7 @@ class MedicalConfig:
         # Knowledge base path (project root directory)
         self.knowledge_paths = self.setup_knowledge_paths()
 
-        # Training parameters
+        # Training parameters (now customizable)
         self.epochs = 30
         self.batch_size = 2
         self.learning_rate = 1e-5
@@ -96,6 +108,19 @@ class MedicalConfig:
         self.languages = ["CN", "EN"]
         self.current_lang = "EN"
 
+        # OLLAMA generation model configuration
+        self.ollama_generation_models = self.detect_ollama_models()
+        self.active_generation_model = "llama3" if "llama3" in self.ollama_generation_models else \
+        self.ollama_generation_models[0] if self.ollama_generation_models else None
+        self.generation_temp = 0.7
+        self.generation_top_p = 0.9
+        self.context_window = 4096
+        self.enable_knowledge_distillation = True
+
+        # Hybrid training parameters
+        self.hybrid_training = True  # Enable CPU-GPU hybrid training
+        self.faiss_parallel = min(multiprocessing.cpu_count(), 8)  # Number of CPU cores for Faiss
+
         # Load local models
         self.tokenizer = self.load_tokenizer()
         self.embedding_model = self.load_ollama_embeddings()
@@ -104,7 +129,38 @@ class MedicalConfig:
         print(f"GPT-2 Model Exists: {self.gpt2_exists}")
         print(f"Knowledge Paths: {self.knowledge_paths}")
         print(f"Using GPU: {self.cuda_available}")
+        print(f"Hybrid Training: {self.hybrid_training}")
+        print(f"Faiss Parallel: {self.faiss_parallel} threads")
+        print(f"Available OLLAMA Models: {self.ollama_generation_models}")
+        print(f"Active Generation Model: {self.active_generation_model}")
         print("=====================================")
+
+    def detect_ollama_models(self):
+        """Automatically detect locally available OLLAMA models"""
+        print("Detecting local OLLAMA models...")
+        available_models = []
+
+        try:
+            # Run ollama list command to get installed models
+            result = subprocess.run(["ollama", "list"], capture_output=True, text=True, check=True)
+            lines = result.stdout.split('\n')
+
+            # Parse output to get model names
+            for line in lines[1:]:  # Skip header
+                if line.strip():
+                    parts = line.split()
+                    if parts:  # Ensure there are parts
+                        model_name = parts[0]
+                        available_models.append(model_name)
+                        print(f"Found OLLAMA model: {model_name}")
+
+            if not available_models:
+                print("No OLLAMA models found. Please install models with 'ollama pull <model>'")
+        except Exception as e:
+            print(f"Error detecting OLLAMA models: {str(e)}")
+            print("Make sure OLLAMA is installed and running")
+
+        return available_models
 
     def set_language(self, lang):
         """Set current language for responses"""
@@ -176,6 +232,53 @@ class MedicalConfig:
             return None
 
 
+# ========== OLLAMA GENERATOR ==========
+from langchain_community.llms import Ollama
+
+
+class OllamaGenerator:
+    def __init__(self, config):
+        self.config = config
+        self.models = {}
+        self.load_models()
+
+    def load_models(self):
+        """Load all OLLAMA generation models"""
+        for model_name in self.config.ollama_generation_models:
+            try:
+                self.models[model_name] = Ollama(
+                    model=model_name,
+                    base_url=self.config.ollama_model_path,
+                    temperature=self.config.generation_temp,
+                    top_p=self.config.generation_top_p
+                )
+                print(f"Loaded OLLAMA model: {model_name}")
+            except Exception as e:
+                print(f"Failed to load {model_name}: {str(e)}")
+
+    def generate(self, prompt, model_name=None):
+        """Generate text using specified model"""
+        model = model_name or self.config.active_generation_model
+        if model not in self.models:
+            print(f"Model {model} not available. Using default.")
+            model = self.config.active_generation_model
+
+        try:
+            response = self.models[model].invoke(prompt)
+            return response.strip()
+        except Exception as e:
+            print(f"Generation error: {str(e)}")
+            return ""
+
+    def set_active_model(self, model_name):
+        """Set current active model"""
+        if model_name in self.models:
+            self.config.active_generation_model = model_name
+            print(f"Active model set to: {model_name}")
+            return True
+        return False
+
+
 # ========== KNOWLEDGE BASE ==========
 class MedicalKnowledgeBase:
     def __init__(self, config):
@@ -185,6 +288,8 @@ class MedicalKnowledgeBase:
         self.disease_info = {}
         self.symptom_info = {}
         self.total_chunks = 0
+        self.generator = OllamaGenerator(config)  # OLLAMA generator for knowledge enhancement
+        self.faiss_index = None  # Faiss index for hybrid CPU-GPU search
 
         # Load knowledge
         self.load_knowledge()
@@ -288,6 +393,37 @@ class MedicalKnowledgeBase:
             print(f"Error extracting medical info: {str(e)}")
             return False
 
+    def enhance_knowledge(self):
+        """Enhance knowledge base using OLLAMA models"""
+        if not self.config.enable_knowledge_distillation or not self.generator.models:
+            print("Knowledge distillation disabled or no models available")
+            return
+
+        print("Enhancing knowledge with OLLAMA models...")
+        enhanced_chunks = []
+
+        # Limit to 5 chunks for demonstration (can be increased)
+        for chunk in tqdm(self.chunks[:5], desc="Enhancing knowledge"):
+            prompt = f"""
+            You are a medical expert. Based on the following medical knowledge fragment, 
+            generate a more detailed and structured medical knowledge description:
+
+            Original content: {chunk}
+
+            Requirements:
+            1. Describe disease, symptoms, and treatments in a clear structure
+            2. Add relevant medical background knowledge
+            3. Use professional but understandable medical language
+            """
+
+            enhanced = self.generator.generate(prompt)
+            if enhanced:
+                enhanced_chunks.append(enhanced)
+
+        # Add enhanced content to knowledge base
+        self.chunks.extend(enhanced_chunks)
+        print(f"Added {len(enhanced_chunks)} enhanced knowledge chunks")
+
     def load_knowledge(self):
         """Load all knowledge base files - with flexible text processing"""
         print("Loading medical knowledge...")
@@ -328,6 +464,9 @@ class MedicalKnowledgeBase:
 
             print(f"Processed {file_count} files in {path}")
 
+        # Enhance knowledge with OLLAMA models
+        self.enhance_knowledge()
+
         # If no diseases were extracted, create some defaults
         if not self.disease_info:
             print("No diseases extracted, creating default knowledge")
@@ -352,22 +491,83 @@ class MedicalKnowledgeBase:
                 "Fever": {"description": "Elevated body temperature", "possible_diseases": ["Infection", "Influenza"]}
             }
 
+    def create_faiss_index(self, embeddings):
+        """Create Faiss index for hybrid CPU-GPU search"""
+        print("Creating Faiss index for hybrid search...")
+        dim = embeddings.shape[1]
+
+        # Choose index type based on data size
+        if len(embeddings) < 10000:
+            index = faiss.IndexFlatL2(dim)
+        else:
+            quantizer = faiss.IndexFlatL2(dim)
+            index = faiss.IndexIVFFlat(quantizer, dim, min(100, len(embeddings) // 10), faiss.METRIC_L2)
+            index.train(embeddings)
+
+        # Move to GPU if available
+        if self.config.faiss_gpu:
+            gpu_index = faiss.index_cpu_to_gpu(self.config.faiss_res, 0, index)
+            gpu_index.add(embeddings)
+            self.faiss_index = gpu_index
+            print("Faiss index created on GPU")
+        else:
+            # Enable parallel CPU processing
+            faiss.omp_set_num_threads(self.config.faiss_parallel)
+            index.add(embeddings)
+            self.faiss_index = index
+            print(f"Faiss index created on CPU with {self.config.faiss_parallel} threads")
+
     def create_vector_store(self):
-        """Create vector store with FAISS"""
+        """Create vector store with FAISS and Faiss hybrid"""
         if not self.chunks or not self.config.embedding_model:
             print("No knowledge chunks or embedding model, skipping vector store")
             return
 
         print(f"Creating vector store with {len(self.chunks)} chunks...")
         try:
+            # First create standard FAISS store
             self.vector_store = FAISS.from_texts(self.chunks, self.config.embedding_model)
-            print("Vector store created")
+            print("FAISS vector store created")
+
+            # Now create Faiss index for hybrid search
+            embeddings = np.array([self.config.embedding_model.embed_query(chunk) for chunk in
+                                   tqdm(self.chunks, desc="Embedding chunks")])
+            self.create_faiss_index(embeddings.astype('float32'))
+
         except Exception as e:
             print(f"Error creating vector store: {str(e)}")
             self.vector_store = None
+            self.faiss_index = None
+
+    def hybrid_search(self, query, k=3):
+        """Perform hybrid CPU-GPU search using Faiss"""
+        if not self.faiss_index:
+            print("Faiss index not available, using simple search")
+            return []
+
+        try:
+            # Embed the query
+            query_embedding = np.array([self.config.embedding_model.embed_query(query)])
+            query_embedding = query_embedding.astype('float32')
+
+            # Search
+            distances, indices = self.faiss_index.search(query_embedding, k)
+
+            # Retrieve results
+            results = []
+            for i, idx in enumerate(indices[0]):
+                if idx >= 0:  # Valid index
+                    results.append({
+                        "chunk": self.chunks[idx],
+                        "distance": distances[0][i]
+                    })
+            return results
+        except Exception as e:
+            print(f"Hybrid search error: {str(e)}")
+            return []
 
     def diagnose(self, symptoms):
-        """Diagnose disease based on symptoms - with FAISS similarity search"""
+        """Diagnose disease based on symptoms - with hybrid search"""
         possible_diseases = {}
 
         # If no symptoms, return empty
@@ -401,26 +601,26 @@ class MedicalKnowledgeBase:
             # Sort by probability
             return sorted(results, key=lambda x: x["probability"], reverse=True)
 
-        # If no matches found, try FAISS similarity search
-        if self.vector_store:
+        # If no matches found, try hybrid search
+        if self.faiss_index:
             try:
-                print("Using FAISS for similarity search...")
+                print("Using hybrid CPU-GPU search...")
                 # Combine symptoms into a query
                 query = "Symptoms: " + ", ".join(symptoms)
 
-                # Search for similar documents
-                docs = self.vector_store.similarity_search(query, k=3)
+                # Perform hybrid search
+                results = self.hybrid_search(query, k=3)
 
                 # Extract diseases from similar documents
-                for doc in docs:
-                    content = doc.page_content
+                for result in results:
+                    content = result["chunk"]
                     # Try to find disease names in the content
                     disease_matches = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b', content)
                     for disease in disease_matches:
                         if disease in self.disease_info:
                             possible_diseases[disease] = possible_diseases.get(disease, 0) + 1
 
-                # If we found matches through similarity search
+                # If we found matches through hybrid search
                 if possible_diseases:
                     results = []
                     for disease, count in possible_diseases.items():
@@ -429,12 +629,12 @@ class MedicalKnowledgeBase:
                             "probability": min(count * 30, 80),  # Max 80% for similarity-based
                             "matched_symptoms": 0,
                             "total_symptoms": 0,
-                            "method": "similarity"
+                            "method": "hybrid"
                         })
                     return sorted(results, key=lambda x: x["probability"], reverse=True)
 
             except Exception as e:
-                print(f"Error in FAISS similarity search: {str(e)}")
+                print(f"Error in hybrid search: {str(e)}")
 
         # If all methods fail, return empty
         return []
@@ -505,8 +705,8 @@ class MedicalAnalysisModel(nn.Module):
         )
 
 
-# ========== TRAINER ==========
-class MedicalTrainer:
+# ========== HYBRID TRAINER ==========
+class HybridMedicalTrainer:
     def __init__(self, config, knowledge_base):
         self.config = config
         self.knowledge_base = knowledge_base
@@ -518,7 +718,8 @@ class MedicalTrainer:
         # Prepare dataset
         dataset = MedicalDataset(knowledge_base, config)
         self.train_loader = DataLoader(
-            dataset, batch_size=config.batch_size, shuffle=True
+            dataset, batch_size=config.batch_size, shuffle=True,
+            num_workers=min(4, multiprocessing.cpu_count())  # Use multiple CPU workers
         )
 
         # Ensure we have training data
@@ -545,7 +746,8 @@ class MedicalTrainer:
 
         # Mixed precision training
         self.scaler = GradScaler() if config.cuda_available else None
-        print(f"Training initialized with {len(dataset)} examples")
+        print(f"Hybrid training initialized with {len(dataset)} examples")
+        print(f"Using {self.train_loader.num_workers} CPU workers for data loading")
 
     def train_epoch(self, epoch):
         if self.model is None:
@@ -558,10 +760,16 @@ class MedicalTrainer:
 
         progress_bar = tqdm(self.train_loader, desc=f"Epoch {epoch + 1}/{self.config.epochs}")
         for batch in progress_bar:
-            # Ensure all tensors are on the correct device
-            input_ids = batch["input_ids"].to(self.config.device)
-            attention_mask = batch["attention_mask"].to(self.config.device)
-            labels = batch["labels"].to(self.config.device)
+            # Move tensors to CPU first (data is on CPU)
+            input_ids = batch["input_ids"]
+            attention_mask = batch["attention_mask"]
+            labels = batch["labels"]
+
+            # Then move to GPU if available
+            if self.config.cuda_available:
+                input_ids = input_ids.to(self.config.device, non_blocking=True)
+                attention_mask = attention_mask.to(self.config.device, non_blocking=True)
+                labels = labels.to(self.config.device, non_blocking=True)
 
             # Mixed precision training
             if self.scaler:
@@ -670,6 +878,30 @@ class MedicalDataset(Dataset):
                 "lang": "EN"
             })
 
+        # 3. Dialog examples
+        self.examples.extend([
+            {
+                "input": "Patient: I've had a headache and fever for two days.\nDoctor:",
+                "output": "<BOS>Based on your symptoms, this could be influenza. Have you experienced any body aches or fatigue?<EOS>",
+                "lang": "EN"
+            },
+            {
+                "input": "Patient: My throat is sore and I'm coughing frequently.\nDoctor:",
+                "output": "<BOS>These symptoms suggest a respiratory infection. Are you experiencing any difficulty breathing?<EOS>",
+                "lang": "EN"
+            },
+            {
+                "input": "患者：我头痛发烧两天了。\n医生：",
+                "output": "<BOS>根据您的症状，可能是流感。您有身体酸痛或疲劳感吗？<EOS>",
+                "lang": "CN"
+            },
+            {
+                "input": "患者：我喉咙痛，还经常咳嗽。\n医生：",
+                "output": "<BOS>这些症状表明可能是呼吸道感染。您有呼吸困难吗？<EOS>",
+                "lang": "CN"
+            }
+        ])
+
     def __len__(self):
         return len(self.examples)
 
@@ -712,6 +944,8 @@ class MedicalAssistant:
         self.config = config
         self.knowledge_base = knowledge_base
         self.conversation_context = []
+        self.dialog_history = []
+        self.max_history = 3
 
         # Load model
         if not os.path.exists(model_path):
@@ -746,15 +980,9 @@ class MedicalAssistant:
         # Response logic
         if not diagnoses:
             if len(self.conversation_context) > 2:  # After multiple attempts
-                return self.response(
-                    "Based on the current knowledge base, the cause cannot be determined. Please update the knowledge base.",
-                    "Based on the current knowledge base, the cause cannot be determined. Please update the knowledge base."
-                )
+                return "Based on the current knowledge base, the cause cannot be determined. Please update the knowledge base."
             else:  # First attempt
-                return self.response(
-                    "Please describe your symptoms in more detail.",
-                    "Please describe your symptoms in more detail."
-                )
+                return "Please describe your symptoms in more detail."
 
         # Get highest probability disease
         top_diagnosis = diagnoses[0]
@@ -762,20 +990,56 @@ class MedicalAssistant:
         treatment = self.knowledge_base.get_treatment_plan(disease)
 
         # Generate response
-        if self.config.current_lang == "CN":
-            response = (
-                f"根据症状分析，患者可能患有{disease}（匹配度{top_diagnosis['probability']}%）。\n\n"
-                f"建议检查：\n{self.format_list(treatment['treatments'])}\n\n"
-                f"推荐药物：\n{self.format_list(treatment['medications'])}\n\n"
-                f"请注意：此为AI建议，请咨询专业医师确认诊断"
+        response = (
+            f"Based on symptom analysis, the patient may have {disease} (confidence {top_diagnosis['probability']}%).\n\n"
+            f"Recommended tests:\n{self.format_list(treatment['treatments'])}\n\n"
+            f"Recommended medications:\n{self.format_list(treatment['medications'])}\n\n"
+            f"Note: This is AI-generated advice. Please consult a medical professional."
+        )
+
+        return response
+
+    def chat(self, user_input, lang=None):
+        """Handle multi-turn dialog"""
+        if lang:
+            self.config.set_language(lang)
+
+        # Update dialog history
+        self.dialog_history.append(f"User: {user_input}")
+        if len(self.dialog_history) > self.max_history * 2:  # Keep recent 3 turns
+            self.dialog_history = self.dialog_history[-self.max_history * 2:]
+
+        # Build context with history
+        context = "\n".join(self.dialog_history) + "\nAssistant:"
+
+        # Encode input
+        input_ids = self.config.tokenizer.encode(
+            context,
+            return_tensors="pt",
+            max_length=self.config.max_seq_length,
+            truncation=True
+        ).to(self.config.device)
+
+        # Generate response
+        with torch.no_grad():
+            output = self.model.generate(
+                input_ids,
+                max_length=self.config.max_seq_length,
+                num_return_sequences=1,
+                pad_token_id=self.config.tokenizer.eos_token_id,
+                temperature=0.7,
+                top_p=0.9
             )
-        else:
-            response = (
-                f"Based on symptom analysis, the patient may have {disease} (confidence {top_diagnosis['probability']}%).\n\n"
-                f"Recommended tests:\n{self.format_list(treatment['treatments'])}\n\n"
-                f"Recommended medications:\n{self.format_list(treatment['medications'])}\n\n"
-                f"Note: This is AI-generated advice. Please consult a medical professional."
-            )
+
+        # Decode response
+        response = self.config.tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # Extract assistant's latest response
+        if "Assistant:" in response:
+            response = response.split("Assistant:")[-1].strip()
+
+        # Update dialog history
+        self.dialog_history.append(f"Assistant: {response}")
 
         return response
 
@@ -809,15 +1073,10 @@ class MedicalAssistant:
             return "None"
         return "\n".join([f"- {item}" for item in items])
 
-    def response(self, cn_text, en_text):
-        """Return response based on current language"""
-        if self.config.current_lang == "CN":
-            return cn_text
-        return en_text
-
     def clear_context(self):
         """Clear conversation context"""
         self.conversation_context = []
+        self.dialog_history = []
 
 
 # ========== MAIN ==========
@@ -839,7 +1098,7 @@ def main():
 
         # Train model
         print("\n[2/3] Training Medical Analysis Model...")
-        trainer = MedicalTrainer(config, knowledge_base)
+        trainer = HybridMedicalTrainer(config, knowledge_base)
 
         best_loss = float('inf')
         best_epoch = -1
@@ -866,12 +1125,13 @@ def main():
 
         # Interactive interface
         print("\n=== MEDICAL ANALYSIS ASSISTANT ===")
-        print("Commands: lang [CN/EN], clear, exit")
+        print("Commands: lang [CN/EN], clear, exit, /model [name], /set [param] [value]")
+        print(f"Available OLLAMA models: {config.ollama_generation_models}")
 
         while True:
             try:
                 # Get user input
-                user_input = input("\nPatient Symptoms: ").strip()
+                user_input = input("\nPatient: ").strip()
 
                 # Process commands
                 if user_input.lower() == "exit":
@@ -882,15 +1142,53 @@ def main():
                     print(f"Language set to: {lang}")
                     continue
                 elif user_input.lower() == "clear":
-                    if assistant:
-                        assistant.clear_context()
-                        print("Conversation context cleared")
+                    assistant.clear_context()
+                    print("Conversation context cleared")
+                    continue
+                elif user_input.startswith("/model "):
+                    model_name = user_input.split()[1]
+                    if knowledge_base.generator.set_active_model(model_name):
+                        print(f"Model switched to: {model_name}")
+                    else:
+                        print(f"Model not available. Options: {config.ollama_generation_models}")
+                    continue
+                elif user_input.startswith("/set "):
+                    try:
+                        parts = user_input.split()
+                        param = parts[1]
+                        value = parts[2]
+
+                        if param == "temp":
+                            config.generation_temp = float(value)
+                            print(f"Temperature set to {value}")
+                        elif param == "topp":
+                            config.generation_top_p = float(value)
+                            print(f"Top-p set to {value}")
+                        elif param == "epochs":
+                            config.epochs = int(value)
+                            print(f"Training epochs set to {value}")
+                        elif param == "batch":
+                            config.batch_size = int(value)
+                            print(f"Batch size set to {value}")
+                        elif param == "lr":
+                            config.learning_rate = float(value)
+                            print(f"Learning rate set to {value}")
+                        else:
+                            print("Invalid parameter. Options: temp, topp, epochs, batch, lr")
+                    except:
+                        print("Invalid command. Usage: /set [param] [value]")
                     continue
 
-                # Analyze symptoms
+                # Analyze symptoms or chat
                 if assistant and assistant.model:
                     start_time = time.time()
-                    response = assistant.analyze_symptoms(user_input)
+
+                    # For symptom analysis
+                    if "symptom" in user_input.lower() or "pain" in user_input.lower():
+                        response = assistant.analyze_symptoms(user_input)
+                    else:  # For general conversation
+                        response = assistant.chat(user_input)
+
                     response_time = time.time() - start_time
 
                     # Display response
