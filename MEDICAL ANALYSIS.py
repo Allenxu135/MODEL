@@ -1,4 +1,27 @@
-# ... 其他代码保持不变 ...
+import os
+import re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+from langchain_community.vectorstores import FAISS
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
+import csv
+import faiss
+from langchain_community.llms import Ollama
+from sklearn.metrics.pairwise import cosine_similarity
+from collections import defaultdict
+import json
+import docx
+from PyPDF2 import PdfReader
+import logging
+import langid
+from deep_translator import GoogleTranslator
+import torch
+from transformers import AutoModel, AutoTokenizer
+
 
 # ========== LOGGER SETUP ==========
 def setup_logger():
@@ -130,6 +153,9 @@ class MedicalKnowledgeBase:
 
         # Train Ollama model
         self.train_ollama_model()
+
+        # Generate learning charts
+        self.generate_learning_charts()
 
         logger.info(
             f"Knowledge base loaded. Diseases: {len(self.disease_info)}, Symptoms: {len(self.symptom_info)}, Chunks: {len(self.chunks)}")
@@ -454,6 +480,65 @@ class MedicalKnowledgeBase:
         # Use Ollama to generate recommendations
         response = self.ollama_generator.invoke(prompt)
         return response
+
+    def generate_learning_charts(self):
+        """Generate learning charts for SCI papers"""
+        logger.info("Generating learning charts for SCI papers...")
+
+        try:
+            # Create disease-symptom count chart
+            diseases = list(self.disease_info.keys())
+            symptom_counts = [len(info["symptoms"]) for info in self.disease_info.values()]
+
+            plt.figure(figsize=(12, 8))
+            sns.barplot(x=diseases, y=symptom_counts, palette="viridis")
+            plt.title("Diseases and Their Symptom Counts", fontsize=16)
+            plt.xlabel("Disease", fontsize=14)
+            plt.ylabel("Number of Symptoms", fontsize=14)
+            plt.xticks(rotation=45, ha="right")
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.config.chart_dir, "disease_symptom_counts.png"), dpi=300)
+            plt.close()
+
+            # Create learning statistics chart
+            stats_df = pd.DataFrame({
+                "Metric": ["Files Processed", "Diseases Extracted", "Symptoms Extracted", "Chunks Created"],
+                "Count": [
+                    self.learning_stats["files_processed"],
+                    self.learning_stats["diseases_extracted"],
+                    self.learning_stats["symptoms_extracted"],
+                    self.learning_stats["chunks_created"]
+                ]
+            })
+
+            plt.figure(figsize=(10, 6))
+            sns.barplot(data=stats_df, x="Metric", y="Count", palette="muted")
+            plt.title("Knowledge Base Learning Statistics", fontsize=16)
+            plt.xlabel("Metric", fontsize=14)
+            plt.ylabel("Count", fontsize=14)
+            plt.grid(axis='y', linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.config.chart_dir, "learning_statistics.png"), dpi=300)
+            plt.close()
+
+            # Create symptom distribution chart
+            if self.symptom_info:
+                symptom_names = list(self.symptom_info.keys())
+                disease_counts = [len(self.symptom_info[s]["possible_diseases"]) for s in symptom_names]
+
+                plt.figure(figsize=(12, 8))
+                sns.scatterplot(x=symptom_names, y=disease_counts, s=100)
+                plt.title("Symptoms and Associated Diseases", fontsize=16)
+                plt.xlabel("Symptom", fontsize=14)
+                plt.ylabel("Number of Associated Diseases", fontsize=14)
+                plt.xticks(rotation=45, ha="right")
+                plt.tight_layout()
+                plt.savefig(os.path.join(self.config.chart_dir, "symptom_disease_association.png"), dpi=300)
+                plt.close()
+
+            logger.info("Learning charts generated successfully")
+        except Exception as e:
+            logger.error(f"Error generating charts: {str(e)}")
 
 
 # ========== MEDICAL ASSISTANT ==========
