@@ -4,29 +4,25 @@ import json
 import logging
 import difflib
 import numpy as np
+import csv
 from datetime import datetime
 from difflib import SequenceMatcher
-from googletrans import Translator
-from collections import defaultdict
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-import torch
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-from transformers import TrainingArguments, Trainer
+import asyncio
+from deep_translator import GoogleTranslator
 import Levenshtein
 
 
 # ========== LOGGER SETUP ==========
 def setup_logger():
-    """Set up logger"""
+    """设置日志记录器 (Set up logger)"""
     log_dir = "logs"
     os.makedirs(log_dir, exist_ok=True)
 
-    # Create timestamped log file
+    # 创建带时间戳的日志文件
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = os.path.join(log_dir, f"medical_diagnosis_{timestamp}.log")
 
-    # Configure logging
+    # 配置日志
     logging.basicConfig(
         filename=log_file,
         level=logging.INFO,
@@ -34,7 +30,7 @@ def setup_logger():
         encoding='utf-8'
     )
 
-    # Add console output
+    # 添加控制台输出
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
     formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
@@ -44,74 +40,70 @@ def setup_logger():
     return logging.getLogger('MedicalDiagnosis')
 
 
-# Initialize logger
+# 初始化日志记录器
 logger = setup_logger()
 
 
-# ========== CONFIGURATION ==========
+# ========== 配置 ==========
 class MedicalConfig:
     def __init__(self):
-        # Knowledge base paths
+        # 知识库路径
         self.knowledge_paths = self.setup_knowledge_paths()
 
-        # Model directory
+        # 模型目录
         self.model_dir = "trained_models"
         os.makedirs(self.model_dir, exist_ok=True)
-        logger.info(f"Model directory: {self.model_dir}")
+        logger.info(f"模型目录 | Model directory: {self.model_dir}")
 
-        # Ollama model configuration
+        # Ollama模型配置
         self.ollama_base_url = "http://localhost:11434"
-        self.ollama_model = "llama3"
+        self.ollama_model = "llama2"
         self.generation_temp = 0.7
         self.generation_top_p = 0.9
-        self.diagnosis_threshold = 0.95  # 95% confidence threshold
-        self.max_attempts = 2  # Maximum inquiry attempts
+        self.diagnosis_threshold = 0.95  # 95%置信度阈值
+        self.max_attempts = 2  # 最大询问尝试次数
 
-        # Training configuration
+        # 训练配置
         self.epochs = 4
         self.batch_size = 4
         self.learning_rate = 2e-5
-        self.ddd_threshold = 1.0  # High DDD value threshold
+        self.ddd_threshold = 1.0  # DDD高阈值
 
-        logger.info("\n=== MEDICAL ANALYSIS CONFIGURATION ===")
-        logger.info(f"Knowledge Paths: {self.knowledge_paths}")
-        logger.info(f"Ollama Model: {self.ollama_model}")
-        logger.info(f"Diagnosis Threshold: {self.diagnosis_threshold * 100}%")
-        logger.info(f"Max Inquiry Attempts: {self.max_attempts}")
-        logger.info(f"Training Epochs: {self.epochs}")
-        logger.info("=====================================")
+        logger.info("\n=== 医疗分析配置 | MEDICAL ANALYSIS CONFIGURATION ===")
+        logger.info(f"知识路径 | Knowledge Paths: {self.knowledge_paths}")
+        logger.info(f"Ollama模型 | Ollama Model: {self.ollama_model}")
+        logger.info(f"诊断阈值 | Diagnosis Threshold: {self.diagnosis_threshold * 100}%")
+        logger.info(f"最大询问次数 | Max Inquiry Attempts: {self.max_attempts}")
+        logger.info(f"训练轮数 | Training Epochs: {self.epochs}")
+        logger.info("===================================================")
 
     def setup_knowledge_paths(self):
-        """Set knowledge base paths to 'knowledge_base' folder"""
+        """设置知识库路径为'knowledge_base'文件夹 (Set knowledge base paths)"""
         knowledge_dir = os.path.join(os.getcwd(), "knowledge_base")
         os.makedirs(knowledge_dir, exist_ok=True)
-        logger.info(f"Knowledge path: {knowledge_dir}")
+        logger.info(f"知识路径 | Knowledge path: {knowledge_dir}")
         return [knowledge_dir]
 
-    def translate_to_english(self, text):
-        """Translate text to English"""
+    async def translate_to_english(self, text):
+        """异步翻译文本到英文 (Translate text to English asynchronously)"""
         try:
-            # Skip translation if already in English
-            if self.is_english(text):
-                return text
-            return Translator().translate(text, dest='en').text
+            # 使用 to_thread 运行同步翻译任务
+            return await asyncio.to_thread(GoogleTranslator(source='auto', target='en').translate, text)
         except Exception as e:
-            logger.error(f"Translation error: {str(e)}")
+            logger.error(f"翻译错误 | Translation error: {str(e)}")
             return text
 
-    def translate_to_chinese(self, text):
-        """Translate text to Chinese"""
+    async def translate_to_chinese(self, text):
+        """异步翻译文本到中文 (Translate text to Chinese asynchronously)"""
         try:
-            # Skip translation if already in Chinese
-            if self.is_chinese(text):
-                return text
-            return Translator().translate(text, dest='zh-cn').text
+            # 使用 asyncio.to_thread 来运行同步翻译任务
+            return await asyncio.to_thread(GoogleTranslator(source='auto', target='zh-CN').translate, text)
         except Exception as e:
-            logger.error(f"Translation error: {str(e)}")
+            logger.error(f"翻译错误 | Translation error: {str(e)}")
             return text
 
     def is_english(self, text):
-        """Check if text is English"""
+        """检查文本是否为英文 (Check if text is English)"""
         try:
             text.encode('ascii')
             return True
@@ -119,32 +111,50 @@ class MedicalConfig:
             return False
 
     def is_chinese(self, text):
-        """Check if text is Chinese"""
+        """检查文本是否为中文 (Check if text is Chinese)"""
         return any('\u4e00' <= char <= '\u9fff' for char in text)
 
+    async def translate_bilingual(self, en_text, cn_text):
+        """创建双语文本 (Create bilingual text)"""
+        return f"🌐 ENGLISH:\n{en_text}\n\n🌐 中文:\n{cn_text}"
 
-# ========== KNOWLEDGE BASE ==========
+
+# ========== 知识库 ==========
 class MedicalKnowledgeBase:
     def __init__(self, config):
         self.config = config
         self.disease_info = {}
         self.symptom_info = {}
         self.medication_ddd_info = {}
+        self.full_knowledge = []  # 存储完整的知识库内容
         self.learning_stats = {
             "files_processed": 0,
             "diseases_extracted": 0,
             "symptoms_extracted": 0,
             "medications_extracted": 0,
-            "tests_extracted": 0
+            "tests_extracted": 0,
+            "total_size_kb": 0
         }
 
-        # Load knowledge
+        # 加载知识
         self.load_knowledge()
-        logger.info(f"知识库加载完成: {len(self.disease_info)}种疾病, {len(self.symptom_info)}种症状")
+        logger.info(f"知识库加载完成 | Knowledge base loaded: "
+                    f"{len(self.disease_info)}种疾病 | diseases, "
+                    f"{len(self.symptom_info)}种症状 | symptoms, "
+                    f"{self.learning_stats['files_processed']}个文件 | files, "
+                    f"{self.learning_stats['total_size_kb']:.2f} KB内容 | content")
 
-    def extract_medical_info(self, text):
-        """从文本中提取医疗信息 (支持多语言)"""
+    def extract_medical_info(self, text, file_path):
+        """从文本中提取医疗信息 (支持多语言) (Extract medical info from text)"""
         try:
+            # 保存完整知识
+            self.full_knowledge.append({
+                "file_path": file_path,
+                "content": text,
+                "size_kb": len(text.encode('utf-8')) / 1024
+            })
+            self.learning_stats["total_size_kb"] += len(text.encode('utf-8')) / 1024
+
             # 疾病提取 (支持中英文)
             disease_pattern = r'(?:disease|condition|illness|diagnosis|疾病|病症|诊断)[\s:：]*([^\n]+)'
             disease_matches = re.findall(disease_pattern, text, re.IGNORECASE)
@@ -159,26 +169,28 @@ class MedicalKnowledgeBase:
                 for sm in symptom_matches:
                     symptoms.extend([s.strip() for s in re.split(r'[,，、]', sm)])
 
-                # 药物提取 (支持中英文)
+                # 药物提取 (支持中英文) - 包含DDD值
                 medications = []
                 medication_pattern = r'(?:medications|drugs|prescriptions|剂量|药物)[\s:：]*([^\n]+)'
                 medication_matches = re.findall(medication_pattern, text, re.IGNORECASE)
 
                 for mm in medication_matches:
                     for line in mm.split('\n'):
-                        # 支持多种格式的药物描述
+                        # 支持多种格式的药物描述，包括DDD值
                         med_match = re.search(
-                            r'([a-zA-Z\u4e00-\u9fff]+[\s\-]*[a-zA-Z\u4e00-\u9fff]*\d*)[\s(]*([\d.]+)?\s*([a-zA-Z\u4e00-\u9fff]*)?',
-                            line)
+                            r'([a-zA-Z\u4e00-\u9fff]+[\s\-]*[a-zA-Z\u4e00-\u9fff]*\d*)[\s(]*([\d.]+)?\s*([a-zA-Z\u4e00-\u9fff]*)?\s*(?:DDD:?\s*([\d.]+))?',
+                            line, re.IGNORECASE)
                         if med_match:
                             name = med_match.group(1).strip()
                             dosage = med_match.group(2) if med_match.group(2) else ""
                             unit = med_match.group(3) if med_match.group(3) else ""
+                            ddd_value = float(med_match.group(4)) if med_match.group(4) else None
 
                             medications.append({
                                 'name': name,
                                 'dosage': dosage,
-                                'unit': unit
+                                'unit': unit,
+                                'ddd': ddd_value
                             })
 
                 # 检查提取 (支持中英文)
@@ -199,6 +211,11 @@ class MedicalKnowledgeBase:
                     self.learning_stats["medications_extracted"] += len(medications)
                     self.learning_stats["tests_extracted"] += len(tests)
 
+                    # 存储药物DDD信息
+                    for med in medications:
+                        if med['ddd'] is not None:
+                            self.medication_ddd_info[med['name']] = med['ddd']
+
             # 提取症状信息
             symptom_names = set()
             for symptom_list in [info["symptoms"] for info in self.disease_info.values()]:
@@ -214,95 +231,97 @@ class MedicalKnowledgeBase:
 
             return True
         except Exception as e:
-            logger.error(f"医疗信息提取错误: {str(e)}")
+            logger.error(f"医疗信息提取错误 | Medical info extraction error: {str(e)}")
             return False
 
-    def calculate_ddd(self, medication, dosage, unit, frequency):
-        """计算DDD值 - 简化版"""
+    async def calculate_ddd(self, medication, dosage, unit, frequency):
+        """计算DDD值 (Calculate DDD value)"""
         # 1. 首先检查知识库中是否有该药物的DDD信息
         if medication in self.medication_ddd_info:
-            ddd_info = self.medication_ddd_info[medication]
-            return self._perform_ddd_calculation(ddd_info, dosage, unit), None
+            ddd_value = self.medication_ddd_info[medication]
+            return ddd_value, None
 
         # 2. 知识库中没有则尝试寻找替代药物
-        alternatives = self.find_alternative_medications(medication)
+        alternatives = await self.find_alternative_medications(medication)
         if alternatives:
             return None, alternatives  # 返回None表示需要换药
 
         # 3. 最后尝试预测DDD
         return self.predict_ddd_with_ollama(medication, dosage, unit, frequency), None
 
-    def find_alternative_medications(self, medication):
-        """在知识库中寻找替代药物"""
+    async def find_alternative_medications(self, medication):
+        """在知识库中寻找替代药物 (Find alternative medications in knowledge base)"""
         alternatives = []
         for disease, info in self.disease_info.items():
             for med in info.get("medications", []):
                 med_name = med["name"]
                 # 相似药物匹配 (支持多语言)
-                if self.is_similar_medication(medication, med_name) and med_name != medication:
+                if await self.is_similar_medication(medication, med_name) and med_name != medication:
                     alternatives.append(med_name)
         return list(set(alternatives))  # 去重
 
-    def is_similar_medication(self, med1, med2):
-        """检查药物是否相似 (支持多语言)"""
+    async def is_similar_medication(self, med1, med2):
+        """检查药物是否相似 (支持多语言) (Check if medications are similar)"""
         # 翻译为英文后比较
-        med1_en = self.config.translate_to_english(med1).lower()
-        med2_en = self.config.translate_to_english(med2).lower()
-        return SequenceMatcher(None, med1_en, med2_en).ratio() > 0.7
+        med1_en = await self.config.translate_to_english(med1)
+        med2_en = await self.config.translate_to_english(med2)
 
-    def _perform_ddd_calculation(self, ddd_info, dosage, unit):
-        """执行DDD计算 (简化版)"""
-        try:
-            # 实际应用中这里会有更复杂的计算逻辑
-            return float(ddd_info.get("ddd_value", 0))
-        except:
-            return 0.0
+        # 检查翻译结果是否为 None 或空字符串，并进行小写转换
+        med1_en_lower = (med1_en or "").lower()
+        med2_en_lower = (med2_en or "").lower()
+
+        if not med1_en_lower or not med2_en_lower:
+            return False  # 如果翻译失败，认为不相似
+
+        return SequenceMatcher(None, med1_en_lower, med2_en_lower).ratio() > 0.7
 
     def predict_ddd_with_ollama(self, medication, dosage, unit, frequency):
-        """当没有DDD信息时尝试预测"""
+        """当没有DDD信息时尝试预测 (Predict DDD when no information available)"""
         # 在实际应用中，这里会调用Ollama进行预测
         # 简化版：返回0.0
         return 0.0, None
 
     def load_knowledge(self):
-        """Load all knowledge base files from knowledge_base folder"""
-        logger.info("Loading medical knowledge from local knowledge_base folder...")
+        """从知识库文件夹加载所有知识库文件 (Load all knowledge base files)"""
+        logger.info("从本地知识库文件夹加载医疗知识 | Loading medical knowledge from local knowledge_base folder...")
 
         for path in self.config.knowledge_paths:
             if not os.path.exists(path):
-                logger.warning(f"Knowledge path not found: {path}")
+                logger.warning(f"知识路径未找到 | Knowledge path not found: {path}")
                 continue
 
-            logger.info(f"Processing directory: {path}")
+            logger.info(f"处理目录 | Processing directory: {path}")
             file_count = 0
 
             for root, _, files in os.walk(path):
                 for file in files:
                     file_path = os.path.join(root, file)
                     if any(file_path.endswith(ext) for ext in ('.txt', '.csv', '.json', '.docx', '.pdf')):
-                        logger.info(f"Processing file: {file_path}")
+                        logger.info(f"处理文件 | Processing file: {file_path}")
                         try:
-                            # Load file content
+                            # 加载文件内容
                             content = self.load_file(file_path)
 
-                            # Extract medical information
-                            self.extract_medical_info(content)
+                            # 提取医疗信息
+                            self.extract_medical_info(content, file_path)
 
                             file_count += 1
                             self.learning_stats["files_processed"] += 1
                         except Exception as e:
-                            logger.error(f"Error processing file {file_path}: {str(e)}")
+                            logger.error(f"文件处理错误 | Error processing file {file_path}: {str(e)}")
 
-            logger.info(f"Processed {file_count} files in {path}")
+            logger.info(f"在路径中处理文件数 | Processed {file_count} files in {path}")
 
         # 完全移除任何默认知识添加
         if not self.disease_info:
-            logger.warning("No diseases extracted from knowledge base files")
+            logger.warning("知识库文件中未提取到疾病 | No diseases extracted from knowledge base files")
         if not self.symptom_info:
-            logger.warning("No symptoms extracted from knowledge base files")
+            logger.warning("知识库文件中未提取到症状 | No symptoms extracted from knowledge base files")
+        if not self.full_knowledge:
+            logger.warning("知识库未加载任何内容 | No content loaded in knowledge base")
 
     def load_file(self, file_path):
-        """Load a single knowledge file"""
+        """加载单个知识文件 (Load a single knowledge file)"""
         try:
             content = ""
             if file_path.endswith('.txt'):
@@ -327,16 +346,16 @@ class MedicalKnowledgeBase:
                     for page in pdf_reader.pages:
                         content += page.extract_text() + "\n"
             else:
-                logger.warning(f"Unsupported file format: {file_path}")
+                logger.warning(f"不支持的文件格式 | Unsupported file format: {file_path}")
                 return ""
 
             return content
         except Exception as e:
-            logger.error(f"Error loading file {file_path}: {str(e)}")
+            logger.error(f"文件加载错误 | Error loading file {file_path}: {str(e)}")
             return ""
 
 
-# ========== MEDICAL ASSISTANT ==========
+# ========== 医疗助手 ==========
 class MedicalAssistant:
     def __init__(self, knowledge_base, config):
         self.knowledge_base = knowledge_base
@@ -346,29 +365,32 @@ class MedicalAssistant:
         self.attempt_count = 0
         self.session_id = datetime.now().strftime("%Y%m%d%H%M%S")
 
-    def diagnose(self, chief_complaint):
-        """诊断流程 (类人脑思考过程)"""
-        self.thought_process = [f"患者主诉: {chief_complaint}"]
+    async def diagnose(self, chief_complaint):
+        """诊断流程 (类人脑思考过程) (Diagnosis process)"""
+        self.thought_process = [f"患者主诉 | Patient chief complaint: {chief_complaint}"]
 
         # 步骤1: 初步诊断
         diagnosis = self.initial_diagnosis(chief_complaint)
-        self.thought_process.append(f"初步诊断: {diagnosis['disease']} (置信度: {diagnosis['confidence'] * 100:.1f}%)")
+        self.thought_process.append(
+            f"初步诊断 | Initial diagnosis: {diagnosis['disease']} (置信度 | Confidence: {diagnosis['confidence'] * 100:.1f}%)")
 
         # 步骤2: 知识库验证
-        kb_match = self.check_knowledge_base_match(diagnosis['disease'])
-        self.thought_process.append(f"知识库匹配: {kb_match['match']} (相似度: {kb_match['similarity'] * 100:.1f}%)")
+        kb_match = await self.check_knowledge_base_match(diagnosis['disease'])
+        self.thought_process.append(
+            f"知识库匹配 | Knowledge base match: {kb_match['match']} (相似度 | Similarity: {kb_match['similarity'] * 100:.1f}%)")
 
+        # 步骤3: 检查置信度
         if kb_match['similarity'] < self.config.diagnosis_threshold:
-            return self.handle_low_confidence(kb_match)
+            return await self.handle_low_confidence(kb_match)
 
-        # 步骤3: 用药推荐
-        medication_response = self.recommend_medication(diagnosis['disease'])
+        # 步骤4: 用药推荐
+        medication_response = await self.recommend_medication(diagnosis['disease'])
 
-        # 步骤4: 检查建议
-        test_recommendation = self.recommend_tests(diagnosis['disease'])
+        # 步骤5: 检查建议
+        test_recommendation = await self.recommend_tests(diagnosis['disease'])
 
-        # 步骤5: 生成最终响应
-        return self.generate_final_response(
+        # 步骤6: 生成最终响应
+        return await self.generate_final_response(
             diagnosis,
             kb_match,
             medication_response,
@@ -376,16 +398,16 @@ class MedicalAssistant:
         )
 
     def initial_diagnosis(self, chief_complaint):
-        """初步诊断 (深度思考)"""
+        """初步诊断 (深度思考) (Initial diagnosis - deep thinking)"""
         # 使用Ollama进行初步诊断思考
         prompt = f"""
         作为医疗辅助模型，根据患者主诉进行诊断思考:
         主诉: {chief_complaint}
 
         思考步骤:
-        1. 分析关键症状
-        2. 考虑可能的鉴别诊断
-        3. 评估最可能的疾病
+        1. 分析关键症状 | Analyze key symptoms
+        2. 考虑可能的鉴别诊断 | Consider possible differential diagnoses
+        3. 评估最可能的疾病 | Evaluate the most likely disease
         4. 输出JSON格式: {{"disease": "疾病名称", "confidence": 0.0-1.0}}
         """
 
@@ -399,17 +421,18 @@ class MedicalAssistant:
             # 如果JSON解析失败，使用简单提取
             disease_match = re.search(r'[a-zA-Z\u4e00-\u9fff]+', simulated_response)
             return {
-                "disease": disease_match.group(0) if disease_match else "未知疾病",
+                "disease": disease_match.group(0) if disease_match else "未知疾病 | Unknown Disease",
                 "confidence": 0.8
             }
 
-    def check_knowledge_base_match(self, disease):
-        """检查知识库匹配度 (深度思考)"""
+    async def check_knowledge_base_match(self, disease):
+        """检查知识库匹配度 (深度思考) (Check knowledge base match - deep thinking)"""
         # 获取知识库中所有疾病
         kb_diseases = list(self.knowledge_base.disease_info.keys())
 
         if not kb_diseases:
-            return {"match": "知识库中无相关疾病信息", "similarity": 0.0}
+            return {"match": "知识库中无相关疾病信息 | No relevant disease information in knowledge base",
+                    "similarity": 0.0}
 
         # 计算相似度
         best_match = ""
@@ -417,30 +440,34 @@ class MedicalAssistant:
 
         for kb_disease in kb_diseases:
             # 使用多语言相似度计算
-            similarity = self.calculate_multilingual_similarity(disease, kb_disease)
+            similarity = await self.calculate_multilingual_similarity(disease, kb_disease)
             if similarity > best_similarity:
                 best_similarity = similarity
                 best_match = kb_disease
 
         return {
-            "match": best_match if best_similarity > 0.7 else "无匹配疾病",
+            "match": best_match if best_similarity > 0.7 else "无匹配疾病 | No matching disease",
             "similarity": best_similarity
         }
 
-    def calculate_multilingual_similarity(self, text1, text2):
-        """多语言相似度计算"""
-        # 翻译为英文后比较
-        text1_en = self.config.translate_to_english(text1)
-        text2_en = self.config.translate_to_english(text2)
+    async def calculate_multilingual_similarity(self, text1, text2):
+        """多语言相似度计算 (Multilingual similarity calculation)"""
+        if not text1 or not text2:
+            return 0.0
 
-        # 使用编辑距离计算相似度
+        text1_en = await self.config.translate_to_english(text1) or ""
+        text2_en = await self.config.translate_to_english(text2) or ""
+
+        if not text1_en or not text2_en:
+            return 0.0
+
         return 1 - (Levenshtein.distance(text1_en, text2_en) / max(len(text1_en), len(text2_en)))
 
-    def handle_low_confidence(self, kb_match):
-        """处理低置信度情况"""
+    async def handle_low_confidence(self, kb_match):
+        """处理低置信度情况 (Handle low confidence)"""
         # 在实际应用中，这里会请求更多症状信息
-        # 简化版：直接返回信息
-        self.thought_process.append("诊断置信度过低，请求更多症状信息")
+        self.thought_process.append(
+            "诊断置信度过低，请求更多症状信息 | Diagnosis confidence too low, requesting more symptom details")
 
         # 英文响应
         en_response = f"Diagnosis confidence is below threshold ({self.config.diagnosis_threshold * 100}%)\n"
@@ -449,32 +476,31 @@ class MedicalAssistant:
 
         # 中文响应
         cn_response = f"诊断置信度低于阈值 ({self.config.diagnosis_threshold * 100}%)\n"
-        cn_response += f"知识库最佳匹配: {self.config.translate_to_chinese(kb_match['match'])} (相似度: {kb_match['similarity'] * 100:.1f}%)\n"
+        cn_response += f"知识库最佳匹配: {kb_match['match']} (相似度: {kb_match['similarity'] * 100:.1f}%)\n"
         cn_response += "请提供更多症状细节。"
 
         # 添加思考过程
-        thought_header = "\n\n=== THINKING PROCESS ===\n" + "\n".join(self.thought_process)
-        thought_header_cn = "\n\n=== 思考过程 ===\n" + "\n".join(
-            [self.config.translate_to_chinese(t) for t in self.thought_process])
+        thought_header = "\n\n=== 思考过程 | THINKING PROCESS ===\n" + "\n".join(self.thought_process)
 
-        return f"{en_response}\n\n{cn_response}{thought_header}{thought_header_cn}"
+        return await self.config.translate_bilingual(en_response, cn_response) + thought_header
 
-    def recommend_medication(self, disease):
-        """推荐药物 (类人脑思考过程)"""
-        self.thought_process.append(f"为 {disease} 推荐药物...")
+    async def recommend_medication(self, disease):
+        """推荐药物 (类人脑思考过程) (Recommend medication - deep thinking)"""
+        self.thought_process.append(f"为 {disease} 推荐药物 | Recommending medication for {disease}...")
 
         # 获取知识库中的药物
         medications = self.knowledge_base.disease_info.get(disease, {}).get("medications", [])
 
         if not medications:
-            return {"status": "no_medication", "message": "知识库中无相关药物信息"}
+            return {"status": "no_medication",
+                    "message": "知识库中无相关药物信息 | No medication information in knowledge base"}
 
         # 计算DDD值
         results = []
         total_ddd = 0.0
 
         for med in medications:
-            ddd_value, alternatives = self.knowledge_base.calculate_ddd(
+            ddd_value, alternatives = await self.knowledge_base.calculate_ddd(
                 med["name"], med["dosage"], med["unit"], "daily"
             )
 
@@ -484,13 +510,13 @@ class MedicalAssistant:
                     results.append({
                         "medication": med["name"],
                         "status": "need_alternative",
-                        "message": f"无法计算DDD，建议换药: {alt_text}"
+                        "message": f"无法计算DDD，建议换药 | Cannot calculate DDD, suggested alternatives: {alt_text}"
                     })
                 else:
                     results.append({
                         "medication": med["name"],
                         "status": "no_ddd",
-                        "message": "无法计算DDD且无替代药物"
+                        "message": "无法计算DDD且无替代药物 | Cannot calculate DDD and no alternatives found"
                     })
             else:
                 results.append({
@@ -508,38 +534,41 @@ class MedicalAssistant:
             "total_ddd": total_ddd
         }
 
-    def recommend_tests(self, disease):
-        """推荐检查 (基于知识库的深度思考)"""
-        self.thought_process.append(f"为 {disease} 分析检查需求...")
+    async def recommend_tests(self, disease):
+        """推荐检查 (基于知识库的深度思考) (Recommend tests - deep thinking)"""
+        self.thought_process.append(f"为 {disease} 分析检查需求 | Analyzing test requirements for {disease}...")
 
         # 首先检查知识库中是否有该疾病的相关信息
         disease_info = self.knowledge_base.disease_info.get(disease, {})
 
         if not disease_info:
             # 知识库中没有该疾病信息
-            self.thought_process.append(f"知识库中没有关于 {disease} 的信息")
+            self.thought_process.append(
+                f"知识库中没有关于 {disease} 的信息 | No information about {disease} in knowledge base")
             return None
 
         # 检查知识库中是否有明确的检查建议
         if "tests" in disease_info and disease_info["tests"]:
             tests = disease_info["tests"]
-            self.thought_process.append(f"从知识库中找到 {len(tests)} 项检查建议")
+            self.thought_process.append(
+                f"从知识库中找到 {len(tests)} 项检查建议 | Found {len(tests)} test recommendations in knowledge base")
             return tests
 
         # 知识库中没有明确的检查建议，尝试从症状中推断
         symptoms = disease_info.get("symptoms", [])
-        inferred_tests = self.infer_tests_from_symptoms(symptoms)
+        inferred_tests = await self.infer_tests_from_symptoms(symptoms)
 
         if inferred_tests:
-            self.thought_process.append(f"从 {len(symptoms)} 个症状推断出 {len(inferred_tests)} 项检查")
+            self.thought_process.append(
+                f"从 {len(symptoms)} 个症状推断出 {len(inferred_tests)} 项检查 | Inferred {len(inferred_tests)} tests from {len(symptoms)} symptoms")
             return inferred_tests
 
         # 没有任何可用的检查建议
-        self.thought_process.append(f"无法为 {disease} 推荐任何检查")
+        self.thought_process.append(f"无法为 {disease} 推荐任何检查 | Unable to recommend any tests for {disease}")
         return None
 
-    def infer_tests_from_symptoms(self, symptoms):
-        """从症状推断检查项目 (基于知识库的深度思考)"""
+    async def infer_tests_from_symptoms(self, symptoms):
+        """从症状推断检查项目 (基于知识库的深度思考) (Infer tests from symptoms - deep thinking)"""
         if not symptoms:
             return []
 
@@ -556,7 +585,7 @@ class MedicalAssistant:
             best_match = symptom
             max_similarity = 0
             for kb_symptom in symptom_test_mapping.keys():
-                similarity = self.calculate_symptom_similarity(symptom, kb_symptom)
+                similarity = await self.calculate_symptom_similarity(symptom, kb_symptom)
                 if similarity > max_similarity:
                     max_similarity = similarity
                     best_match = kb_symptom
@@ -568,21 +597,31 @@ class MedicalAssistant:
         # 去重并限制数量
         return list(set(recommended_tests))[:5]  # 最多返回5项
 
-    def calculate_symptom_similarity(self, symptom1, symptom2):
-        """计算症状相似度 (支持多语言)"""
+    async def calculate_symptom_similarity(self, symptom1, symptom2):
+        """计算症状相似度 (支持多语言) (Calculate symptom similarity)"""
         # 翻译为英文后比较
-        symptom1_en = self.config.translate_to_english(symptom1)
-        symptom2_en = self.config.translate_to_english(symptom2)
+        symptom1_en = await self.config.translate_to_english(symptom1)
+        symptom2_en = await self.config.translate_to_english(symptom2)
 
         # 使用编辑距离计算相似度
-        return 1 - (Levenshtein.distance(symptom1_en, symptom2_en) / max(len(symptom1_en), len(symptom2_en)))
+        if symptom1_en and symptom2_en:
+            return 1 - (Levenshtein.distance(symptom1_en, symptom2_en) / max(len(symptom1_en), len(symptom2_en)))
+        return 0.0
 
-    def generate_final_response(self, diagnosis, kb_match, medication, tests):
-        """生成最终双语响应"""
+    async def generate_final_response(self, diagnosis, kb_match, medication, tests):
+        """生成最终双语响应 (Generate final bilingual response)"""
         # 英文部分
-        en_response = f"Diagnosis: {diagnosis['disease']}\n"
+        en_response = f"=== DIAGNOSIS ===\n"
+        en_response += f"Model: {self.config.ollama_model}\n"
+        en_response += f"Disease: {diagnosis['disease']}\n"
         en_response += f"Confidence: {diagnosis['confidence'] * 100:.1f}%\n"
         en_response += f"Knowledge Base Match: {kb_match['match']} (Similarity: {kb_match['similarity'] * 100:.1f}%)\n\n"
+
+        # 添加知识库摘要
+        en_response += "=== KNOWLEDGE BASE SUMMARY ===\n"
+        en_response += f"Total documents: {len(self.knowledge_base.full_knowledge)}\n"
+        en_response += f"Total size: {self.knowledge_base.learning_stats['total_size_kb']:.2f} KB\n"
+        en_response += f"Diseases extracted: {self.knowledge_base.learning_stats['diseases_extracted']}\n\n"
 
         en_response += "Medication Recommendations:\n"
         if medication["status"] == "no_medication":
@@ -604,10 +643,21 @@ class MedicalAssistant:
         else:
             en_response += "No specific tests recommended based on current knowledge"
 
-        # 中文部分 (翻译英文内容)
-        cn_response = f"诊断: {self.config.translate_to_chinese(diagnosis['disease'])}\n"
+        # 中文部分
+        cn_diagnosis = await self.config.translate_to_chinese(diagnosis['disease'])
+        cn_match = await self.config.translate_to_chinese(kb_match['match'])
+
+        cn_response = f"=== 诊断 ===\n"
+        cn_response += f"模型: {self.config.ollama_model}\n"
+        cn_response += f"疾病: {cn_diagnosis}\n"
         cn_response += f"置信度: {diagnosis['confidence'] * 100:.1f}%\n"
-        cn_response += f"知识库匹配: {self.config.translate_to_chinese(kb_match['match'])} (相似度: {kb_match['similarity'] * 100:.1f}%)\n\n"
+        cn_response += f"知识库匹配: {cn_match} (相似度: {kb_match['similarity'] * 100:.1f}%)\n\n"
+
+        # 添加知识库摘要
+        cn_response += "=== 知识库摘要 ===\n"
+        cn_response += f"总文档数: {len(self.knowledge_base.full_knowledge)}\n"
+        cn_response += f"总大小: {self.knowledge_base.learning_stats['total_size_kb']:.2f} KB\n"
+        cn_response += f"提取疾病数: {self.knowledge_base.learning_stats['diseases_extracted']}\n\n"
 
         cn_response += "药物推荐:\n"
         if medication["status"] == "no_medication":
@@ -615,62 +665,67 @@ class MedicalAssistant:
         else:
             for med in medication["medications"]:
                 if med["status"] == "success":
-                    cn_response += f"- {self.config.translate_to_chinese(med['medication'])}: {med['dosage']}{self.config.translate_to_chinese(med['unit'])} (DDD值: {med['ddd']:.2f})\n"
+                    med_name_cn = await self.config.translate_to_chinese(med['medication'])
+                    med_unit_cn = await self.config.translate_to_chinese(med['unit'])
+                    cn_response += f"- {med_name_cn}: {med['dosage']}{med_unit_cn} (DDD值: {med['ddd']:.2f})\n"
                 else:
-                    cn_response += f"- {self.config.translate_to_chinese(med['medication'])}: {self.config.translate_to_chinese(med['message'])}\n"
+                    med_name_cn = await self.config.translate_to_chinese(med['medication'])
+                    med_message_cn = await self.config.translate_to_chinese(med['message'])
+                    cn_response += f"- {med_name_cn}: {med_message_cn}\n"
 
             if medication["total_ddd"] > 0:
                 cn_response += f"总DDD值: {medication['total_ddd']:.2f}\n"
 
         cn_response += "\n推荐检查:\n"
         if tests:
-            cn_tests = "\n".join([f"- {self.config.translate_to_chinese(test)}" for test in tests])
+            # 并行翻译检查项目
+            cn_tests_list = await asyncio.gather(*[self.config.translate_to_chinese(test) for test in tests])
+            cn_tests = "\n".join([f"- {test}" for test in cn_tests_list])
             cn_response += cn_tests
         else:
             cn_response += "基于当前知识库，暂无特定检查建议"
 
         # 添加思考过程
-        thought_header = "\n\n=== THINKING PROCESS ===\n" + "\n".join(self.thought_process)
-        thought_header_cn = "\n\n=== 思考过程 ===\n" + "\n".join(
-            [self.config.translate_to_chinese(t) for t in self.thought_process])
+        thought_header = "\n\n=== 思考过程 | THINKING PROCESS ===\n" + "\n".join(self.thought_process)
 
-        return f"{en_response}\n\n{cn_response}{thought_header}{thought_header_cn}"
+        return await self.config.translate_bilingual(en_response, cn_response) + thought_header
 
 
-# ========== MAIN FUNCTION ==========
-def main():
+# ========== 主函数 ==========
+async def main():
     try:
-        # Initialize configuration
+        # 初始化配置
         config = MedicalConfig()
 
-        # Load knowledge base
-        logger.info("\n[1/2] Loading medical knowledge...")
+        # 加载知识库
+        logger.info("\n[1/2] 加载医疗知识 | Loading medical knowledge...")
         knowledge_base = MedicalKnowledgeBase(config)
 
-        # Initialize medical assistant
-        logger.info("\n[2/2] Starting Medical Assistant")
+        # 初始化医疗助手
+        logger.info("\n[2/2] 启动医疗助手 | Starting Medical Assistant")
         assistant = MedicalAssistant(knowledge_base, config)
 
-        # Interactive interface
-        logger.info("\n=== MEDICAL DIAGNOSTIC ASSISTANT (FOR PHYSICIANS) ===")
-        logger.info("Enter patient symptoms for diagnosis or 'exit' to quit")
-        logger.info(f"Diagnosis threshold: {config.diagnosis_threshold * 100}%")
-        logger.info(f"Max inquiry attempts: {config.max_attempts}")
-        logger.info("Supports Chinese and English input")
+        # 交互界面
+        logger.info("\n=== 医疗诊断助手 (医生版) | MEDICAL DIAGNOSTIC ASSISTANT (FOR PHYSICIANS) ===")
+        logger.info("输入患者症状进行诊断或输入'exit'退出 | Enter patient symptoms for diagnosis or 'exit' to quit")
+        logger.info(f"诊断阈值 | Diagnosis threshold: {config.diagnosis_threshold * 100}%")
+        logger.info(f"最大询问次数 | Max inquiry attempts: {config.max_attempts}")
+        logger.info("支持中英文输入 | Supports Chinese and English input")
 
         while True:
-            user_input = input("\nEnter symptoms: ").strip()
+            user_input = input("\n输入症状 | Enter symptoms: ").strip()
 
             if user_input.lower() == "exit":
                 break
 
-            response = assistant.diagnose(user_input)
-            print(f"\nAssistant: {response}")
+            response = await assistant.diagnose(user_input)
+            print(f"\n助手 | Assistant: {response}")
 
     except Exception as e:
-        logger.error(f"Error: {str(e)}")
-        print(f"系统错误: {str(e)}")
+        error_msg = f"系统错误 | System error: {str(e)}"
+        logger.error(error_msg)
+        print(error_msg)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
