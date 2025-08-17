@@ -247,7 +247,11 @@ class MedicalKnowledgeBase:
             return None, alternatives  # 返回None表示需要换药
 
         # 3. 最后尝试预测DDD
-        return self.predict_ddd_with_ollama(medication, dosage, unit, frequency), None
+        ddd_value = self.predict_ddd_with_ollama(medication, dosage, unit, frequency)
+        if ddd_value is not None:
+            return ddd_value, None
+        else:
+            return None, ["知识库中没有DDD值相关信息，请更新知识库"]  # 返回错误消息
 
     async def find_alternative_medications(self, medication):
         """在知识库中寻找替代药物 (Find alternative medications in knowledge base)"""
@@ -278,8 +282,8 @@ class MedicalKnowledgeBase:
     def predict_ddd_with_ollama(self, medication, dosage, unit, frequency):
         """当没有DDD信息时尝试预测 (Predict DDD when no information available)"""
         # 在实际应用中，这里会调用Ollama进行预测
-        # 简化版：返回0.0
-        return 0.0, None
+        # 但知识库中没有相关信息，返回None表示无法预测
+        return None
 
     def load_knowledge(self):
         """从知识库文件夹加载所有知识库文件 (Load all knowledge base files)"""
@@ -504,13 +508,21 @@ class MedicalAssistant:
                 med["name"], med["dosage"], med["unit"], "daily"
             )
 
-            if ddd_value is None:  # 需要换药
-                if alternatives:
+            if ddd_value is None:  # 需要换药或无法计算DDD
+                if alternatives and isinstance(alternatives, list):
+                    # 如果是替代药物列表
                     alt_text = ", ".join(alternatives[:3])
                     results.append({
                         "medication": med["name"],
                         "status": "need_alternative",
                         "message": f"无法计算DDD，建议换药 | Cannot calculate DDD, suggested alternatives: {alt_text}"
+                    })
+                elif alternatives and isinstance(alternatives, str):
+                    # 如果是错误消息
+                    results.append({
+                        "medication": med["name"],
+                        "status": "no_ddd",
+                        "message": alternatives  # 使用返回的错误消息
                     })
                 else:
                     results.append({
