@@ -162,27 +162,26 @@ class MedicalKnowledgeBase:
                 for sm in symptom_matches:
                     symptoms.extend([s.strip() for s in re.split(r'[,，、]', sm)])
 
-                # 药物提取 (支持中英文) - 包含DDD值
+                # 药物提取 (支持中英文) - 包含规格和DDD值
                 medications = []
                 medication_pattern = r'(?:medications|drugs|prescriptions|剂量|药物)[\s:：]*([^\n]+)'
                 medication_matches = re.findall(medication_pattern, text, re.IGNORECASE)
 
                 for mm in medication_matches:
                     for line in mm.split('\n'):
-                        # 支持多种格式的药物描述，包括DDD值
+                        # 支持多种格式的药物描述，包括规格和DDD值
+                        # 匹配格式: 药物名称 规格 (如: 10mg/片) DDD:值
                         med_match = re.search(
-                            r'([a-zA-Z\u4e00-\u9fff]+[\s\-]*[a-zA-Z\u4e00-\u9fff]*\d*)[\s(]*([\d.]+)?\s*([a-zA-Z\u4e00-\u9fff]*)?\s*(?:DDD:?\s*([\d.]+))?',
+                            r'([a-zA-Z\u4e00-\u9fff]+[\s\-]*[a-zA-Z\u4e00-\u9fff]*\d*)[\s(]*([\d.]+[a-zA-Z\u4e00-\u9fff/]+)\s*(?:DDD:?\s*([\d.]+))?',
                             line, re.IGNORECASE)
                         if med_match:
                             name = med_match.group(1).strip()
-                            dosage = med_match.group(2) if med_match.group(2) else ""
-                            unit = med_match.group(3) if med_match.group(3) else ""
-                            ddd_value = float(med_match.group(4)) if med_match.group(4) else None
+                            specification = med_match.group(2).strip() if med_match.group(2) else ""
+                            ddd_value = float(med_match.group(3)) if med_match.group(3) else None
 
                             medications.append({
                                 'name': name,
-                                'dosage': dosage,
-                                'unit': unit,
+                                'specification': specification,
                                 'ddd': ddd_value
                             })
 
@@ -227,7 +226,7 @@ class MedicalKnowledgeBase:
             logger.error(f"医疗信息提取错误 | Medical info extraction error: {str(e)}")
             return False
 
-    async def calculate_ddd(self, medication, dosage, unit, frequency):
+    async def calculate_ddd(self, medication, specification):
         """计算DDD值 (Calculate DDD value)"""
         # 1. 首先检查知识库中是否有该药物的DDD信息
         if medication in self.medication_ddd_info:
@@ -240,7 +239,7 @@ class MedicalKnowledgeBase:
             return None, alternatives  # 返回None表示需要换药
 
         # 3. 最后尝试预测DDD
-        ddd_value = self.predict_ddd_with_model(medication, dosage, unit, frequency)
+        ddd_value = self.predict_ddd_with_model(medication, specification)
         if ddd_value is not None:
             return ddd_value, None
         else:
@@ -254,8 +253,11 @@ class MedicalKnowledgeBase:
                 med_name = med["name"]
                 # 相似药物匹配 (支持多语言)
                 if await self.is_similar_medication(medication, med_name) and med_name != medication:
-                    alternatives.append(med_name)
-        return list(set(alternatives))  # 去重
+                    alternatives.append({
+                        "name": med_name,
+                        "specification": med.get("specification", "")
+                    })
+        return alternatives  # 返回替代药物列表
 
     async def is_similar_medication(self, med1, med2):
         """检查药物是否相似 (支持多语言) (Check if medications are similar)"""
@@ -272,7 +274,7 @@ class MedicalKnowledgeBase:
 
         return SequenceMatcher(None, med1_en_lower, med2_en_lower).ratio() > 0.7
 
-    def predict_ddd_with_model(self, medication, dosage, unit, frequency):
+    def predict_ddd_with_model(self, medication, specification):
         """使用训练好的模型预测DDD值 (Predict DDD using trained model)"""
         # 这里应该加载训练好的模型进行预测
         # 简化版：返回固定值或基于规则的预测
@@ -281,7 +283,7 @@ class MedicalKnowledgeBase:
             model_path = os.path.join(self.config.model_dir, "ddd_predictor.model")
             if os.path.exists(model_path):
                 # 实际应用中应该加载模型并进行预测
-                # 这里简化处理，返回一个基于名称的简单预测
+                # 这里简化处理，返回一个基于名称和规格的简单预测
                 if "硝苯" in medication or "nifedipine" in medication.lower():
                     return 10.0
                 elif "氨氯" in medication or "amlodipine" in medication.lower():
@@ -289,10 +291,13 @@ class MedicalKnowledgeBase:
                 elif "厄贝" in medication or "irbesartan" in medication.lower():
                     return 150.0
                 else:
-                    # 默认返回一个基于剂量的估计值
+                    # 默认返回一个基于规格的估计值
                     try:
-                        dosage_val = float(dosage) if dosage else 1.0
-                        return dosage_val * 1.5  # 简单估算
+                        # 尝试从规格中提取数字
+                        numbers = re.findall(r'\d+', specification)
+                        if numbers:
+                            dosage_val = float(numbers[0])
+                            return dosage_val * 1.5  # 简单估算
                     except:
                         return 10.0  # 默认值
             else:
@@ -410,8 +415,11 @@ class MedicalAssistant:
 
         # 步骤1: 使用训练好的模型进行初步诊断
         diagnosis = await self.model_based_diagnosis(chief_complaint)
+
+        # 翻译疾病名称用于思考过程
+        disease_en = await self.config.translate_to_english(diagnosis['disease'])
         self.thought_process.append(
-            f"模型诊断 | Model diagnosis: {diagnosis['disease']} (置信度 | Confidence: {diagnosis['confidence'] * 100:.1f}%)")
+            f"模型诊断 | Model diagnosis: {diagnosis['disease']}/{disease_en} (置信度 | Confidence: {diagnosis['confidence'] * 100:.1f}%)")
 
         # 步骤2: 检查置信度是否达到阈值
         if diagnosis['confidence'] < self.config.diagnosis_threshold:
@@ -557,7 +565,9 @@ class MedicalAssistant:
 
     async def recommend_medication(self, disease):
         """推荐药物 (类人脑思考过程) (Recommend medication - deep thinking)"""
-        self.thought_process.append(f"为 {disease} 推荐药物 | Recommending medication for {disease}...")
+        disease_en = await self.config.translate_to_english(disease)
+        self.thought_process.append(
+            f"为 {disease}/{disease_en} 推荐药物 | Recommending medication for {disease}/{disease_en}...")
 
         # 获取知识库中的药物
         medications = self.knowledge_base.disease_info.get(disease, {}).get("medications", [])
@@ -572,15 +582,16 @@ class MedicalAssistant:
 
         for med in medications:
             ddd_value, alternatives = await self.knowledge_base.calculate_ddd(
-                med["name"], med["dosage"], med["unit"], "daily"
+                med["name"], med["specification"]
             )
 
             if ddd_value is None:  # 需要换药或无法计算DDD
-                if alternatives and isinstance(alternatives, list):
+                if alternatives and isinstance(alternatives, list) and len(alternatives) > 0:
                     # 如果是替代药物列表
-                    alt_text = ", ".join(alternatives[:3])
+                    alt_text = ", ".join([f"{alt['name']} ({alt['specification']})" for alt in alternatives[:3]])
                     results.append({
                         "medication": med["name"],
+                        "specification": med["specification"],
                         "status": "need_alternative",
                         "message": f"无法计算DDD，建议换药 | Cannot calculate DDD, suggested alternatives: {alt_text}"
                     })
@@ -588,20 +599,21 @@ class MedicalAssistant:
                     # 如果是错误消息
                     results.append({
                         "medication": med["name"],
+                        "specification": med["specification"],
                         "status": "no_ddd",
                         "message": alternatives  # 使用返回的错误消息
                     })
                 else:
                     results.append({
                         "medication": med["name"],
+                        "specification": med["specification"],
                         "status": "no_ddd",
                         "message": "无法计算DDD且无替代药物 | Cannot calculate DDD and no alternatives found"
                     })
             else:
                 results.append({
                     "medication": med["name"],
-                    "dosage": med["dosage"],
-                    "unit": med["unit"],
+                    "specification": med["specification"],
                     "ddd": ddd_value,
                     "status": "success"
                 })
@@ -615,7 +627,9 @@ class MedicalAssistant:
 
     async def recommend_tests(self, disease):
         """推荐检查 (基于知识库的深度思考) (Recommend tests - deep thinking)"""
-        self.thought_process.append(f"为 {disease} 分析检查需求 | Analyzing test requirements for {disease}...")
+        disease_en = await self.config.translate_to_english(disease)
+        self.thought_process.append(
+            f"为 {disease}/{disease_en} 分析检查需求 | Analyzing test requirements for {disease}/{disease_en}...")
 
         # 首先检查知识库中是否有该疾病的相关信息
         disease_info = self.knowledge_base.disease_info.get(disease, {})
@@ -623,7 +637,7 @@ class MedicalAssistant:
         if not disease_info:
             # 知识库中没有该疾病信息
             self.thought_process.append(
-                f"知识库中没有关于 {disease} 的信息 | No information about {disease} in knowledge base")
+                f"知识库中没有关于 {disease}/{disease_en} 的信息 | No information about {disease}/{disease_en} in knowledge base")
             return None
 
         # 检查知识库中是否有明确的检查建议
@@ -643,7 +657,8 @@ class MedicalAssistant:
             return inferred_tests
 
         # 没有任何可用的检查建议
-        self.thought_process.append(f"无法为 {disease} 推荐任何检查 | Unable to recommend any tests for {disease}")
+        self.thought_process.append(
+            f"无法为 {disease}/{disease_en} 推荐任何检查 | Unable to recommend any tests for {disease}/{disease_en}")
         return None
 
     async def infer_tests_from_symptoms(self, symptoms):
@@ -725,7 +740,9 @@ class MedicalAssistant:
         else:
             for med in medication["medications"]:
                 if med["status"] == "success":
-                    cn_response += f"- {med['medication']}: {med['dosage']}{med['unit']} (DDD值: {med['ddd']:.2f})\n"
+                    cn_response += f"- {med['medication']}: {med['specification']} (DDD值: {med['ddd']:.2f})\n"
+                elif med["status"] == "need_alternative":
+                    cn_response += f"- {med['medication']}: {med['message']}\n"
 
             if medication["total_ddd"] > 0:
                 cn_response += f"总DDD值: {medication['total_ddd']:.2f}\n"
@@ -738,8 +755,12 @@ class MedicalAssistant:
             for med in medication["medications"]:
                 if med["status"] == "success":
                     en_med = await self.config.translate_to_english(med['medication'])
-                    en_unit = await self.config.translate_to_english(med['unit'])
-                    en_response += f"- {en_med}: {med['dosage']}{en_unit} (DDD: {med['ddd']:.2f})\n"
+                    en_spec = await self.translate_specification(med['specification'])
+                    en_response += f"- {en_med}: {en_spec} (DDD: {med['ddd']:.2f})\n"
+                elif med["status"] == "need_alternative":
+                    en_med = await self.config.translate_to_english(med['medication'])
+                    en_msg = await self.config.translate_to_english(med['message'])
+                    en_response += f"- {en_med}: {en_msg}\n"
 
             if medication["total_ddd"] > 0:
                 en_response += f"Total DDD: {medication['total_ddd']:.2f}\n"
@@ -770,6 +791,24 @@ class MedicalAssistant:
         final_response += thought_header
 
         return final_response
+
+    async def translate_specification(self, specification):
+        """翻译药品规格 (Translate medication specification)"""
+        # 简单的单位翻译映射
+        unit_mapping = {
+            "片": "tablet",
+            "粒": "capsule",
+            "毫克": "mg",
+            "毫升": "ml",
+            "/": "/"
+        }
+
+        # 保留数字和特殊字符，翻译中文单位
+        translated = specification
+        for cn, en in unit_mapping.items():
+            translated = translated.replace(cn, en)
+
+        return translated
 
 
 # ========== 主函数 ==========
