@@ -14,14 +14,17 @@ import Levenshtein
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.model_selection import train_test_split
 import psutil
 import GPUtil
 import networkx as nx
 from collections import deque
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 from transformers import BertModel, BertTokenizer, AdamW, get_linear_schedule_with_warmup
-from torch.utils.data import Dataset, DataLoader
+import docx
+from PyPDF2 import PdfReader
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -77,6 +80,10 @@ class MedicalConfig:
         self.kg_dir = "knowledge_graphs"
         os.makedirs(self.kg_dir, exist_ok=True)
 
+        # 数据目录
+        self.data_dir = "data"
+        os.makedirs(self.data_dir, exist_ok=True)
+
         logger.info(f"模型目录 | Model directory: {self.model_dir}")
         logger.info(f"可视化目录 | Visualization directory: {self.viz_dir}")
 
@@ -100,6 +107,7 @@ class MedicalConfig:
         # 模型配置
         self.pretrained_model_name = "bert-base-uncased"
         self.hidden_dropout_prob = 0.3
+        self.max_seq_length = 128
         self.num_labels = 10  # 假设有10种主要疾病类型
 
         # 思考深度配置
@@ -334,6 +342,38 @@ class MedicalKnowledgeGraph:
         return filepath
 
 
+# ========== 医疗数据集 ==========
+class MedicalDataset(Dataset):
+    def __init__(self, texts, labels, tokenizer, max_len):
+        self.texts = texts
+        self.labels = labels
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        text = str(self.texts[idx])
+        label = self.labels[idx]
+
+        encoding = self.tokenizer.encode_plus(
+            text,
+            add_special_tokens=True,
+            max_length=self.max_len,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
+
+        return {
+            'input_ids': encoding['input_ids'].flatten(),
+            'attention_mask': encoding['attention_mask'].flatten(),
+            'labels': torch.tensor(label, dtype=torch.long)
+        }
+
+
 # ========== 知识库 ==========
 class MedicalKnowledgeBase:
     def __init__(self, config):
@@ -536,8 +576,6 @@ class MedicalKnowledgeBase:
 
     def predict_ddd_with_model(self, medication, specification):
         """使用训练好的模型预测DDD值 (Predict DDD using trained model)"""
-        # 这里应该加载训练好的模型进行预测
-        # 简化版：返回固定值或基于规则的预测
         try:
             # 尝试从模型目录加载模型
             model_path = os.path.join(self.config.model_dir, "ddd_predictor.model")
@@ -627,11 +665,9 @@ class MedicalKnowledgeBase:
                     data = json.load(f)
                     content = json.dumps(data, ensure_ascii=False)
             elif file_path.endswith('.docx'):
-                import docx
                 doc = docx.Document(file_path)
                 content = "\n".join([para.text for para in doc.paragraphs])
             elif file_path.endswith('.pdf'):
-                from PyPDF2 import PdfReader
                 with open(file_path, 'rb') as f:
                     pdf_reader = PdfReader(f)
                     for page in pdf_reader.pages:
@@ -645,15 +681,39 @@ class MedicalKnowledgeBase:
             logger.error(f"文件加载错误 | Error loading file {file_path}: {str(e)}")
             return ""
 
+    def prepare_training_data(self):
+        """准备训练数据"""
+        texts = []
+        labels = []
+        label_map = {}
+
+        # 从疾病信息中提取训练数据
+        for i, (disease, info) in enumerate(self.disease_info.items()):
+            if disease not in label_map:
+                label_map[disease] = len(label_map)
+
+            # 创建症状文本
+            symptoms_text = ", ".join(info.get("symptoms", []))
+            if symptoms_text:
+                texts.append(symptoms_text)
+                labels.append(label_map[disease])
+
+            # 创建疾病描述文本
+            disease_text = f"{disease} with symptoms: {symptoms_text}"
+            texts.append(disease_text)
+            labels.append(label_map[disease])
+
+        return texts, labels, label_map
+
 
 # ========== 医疗AI模型 ==========
 class MedicalAIModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, num_labels):
         super(MedicalAIModel, self).__init__()
         self.config = config
         self.bert = BertModel.from_pretrained(config.pretrained_model_name)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.classifier = nn.Linear(self.bert.config.hidden_size, config.num_labels)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, num_labels)
         self.attention_weights = None
 
     def forward(self, input_ids, attention_mask):
@@ -776,7 +836,7 @@ class TrainingMonitor:
 
     def plot_thinking_process(self, thinking_steps, certainty_scores, filename="thinking_process.png"):
         """绘制思考过程图"""
-        plt.figure(figsize=(12, 6))
+        plt.figure(fridth=12, figheight=6)
 
         # 创建思考步骤的条形图
         steps = [f"Step {i + 1}" for i in range(len(thinking_steps))]
@@ -809,9 +869,13 @@ class TrainingMonitor:
 
 # ========== 医疗助手 ==========
 class MedicalAssistant:
-    def __init__(self, knowledge_base, config):
+    def __init__(self, knowledge_base, config, model, tokenizer, label_map):
         self.knowledge_base = knowledge_base
         self.config = config
+        self.model = model
+        self.tokenizer = tokenizer
+        self.label_map = label_map
+        self.reverse_label_map = {v: k for k, v in label_map.items()}
         self.thought_process = []  # 记录思考过程
         self.current_symptoms = []
         self.attempt_count = 0
@@ -819,27 +883,6 @@ class MedicalAssistant:
         self.thinking_steps = []  # 记录思考步骤
         self.certainty_scores = []  # 记录确定性分数
         self.training_monitor = TrainingMonitor(config)
-
-        # 加载训练好的诊断模型
-        self.diagnosis_model = self.load_diagnosis_model()
-
-    def load_diagnosis_model(self):
-        """加载训练好的诊断模型 (Load trained diagnosis model)"""
-        try:
-            model_path = os.path.join(self.config.model_dir, "diagnosis_model.pth")
-            if os.path.exists(model_path):
-                # 加载模型
-                model = MedicalAIModel(self.config)
-                model.load_state_dict(torch.load(model_path))
-                model.eval()
-                logger.info("诊断模型加载成功 | Diagnosis model loaded successfully")
-                return model
-            else:
-                logger.warning("未找到训练好的诊断模型 | Trained diagnosis model not found")
-                return None
-        except Exception as e:
-            logger.error(f"模型加载错误 | Model loading error: {str(e)}")
-            return None
 
     async def deep_think(self, symptoms, depth=0, max_depth=3, current_certainty=0.0):
         """深度思考过程，模拟人脑推理 (Deep thinking process simulating human reasoning)"""
@@ -950,40 +993,39 @@ class MedicalAssistant:
 
     async def model_based_diagnosis(self, symptoms):
         """使用训练好的模型进行诊断 (Diagnosis using trained model)"""
-        # 在实际应用中，这里会调用训练好的模型进行诊断
-        # 简化版：基于知识库的规则匹配
-
-        # 首先将症状列表转换为文本
+        # 将症状列表转换为文本
         symptoms_text = ", ".join(symptoms)
-        symptoms_en = await self.config.translate_to_english(symptoms_text)
 
-        best_match = None
-        best_score = 0
+        # 使用模型进行预测
+        self.model.eval()
 
-        # 在知识库中寻找最匹配的疾病
-        for disease, info in self.knowledge_base.disease_info.items():
-            # 获取疾病的症状
-            disease_symptoms = info.get("symptoms", [])
+        # 编码输入
+        encoding = self.tokenizer.encode_plus(
+            symptoms_text,
+            add_special_tokens=True,
+            max_length=self.config.max_seq_length,
+            padding='max_length',
+            truncation=True,
+            return_attention_mask=True,
+            return_tensors='pt',
+        )
 
-            # 计算匹配分数
-            score = await self.calculate_symptom_match(symptoms_text, disease_symptoms)
+        # 进行预测
+        with torch.no_grad():
+            input_ids = encoding['input_ids']
+            attention_mask = encoding['attention_mask']
 
-            if score > best_score:
-                best_score = score
-                best_match = disease
+            outputs = self.model(input_ids, attention_mask)
+            probabilities = torch.softmax(outputs, dim=1)
+            confidence, predicted_idx = torch.max(probabilities, dim=1)
 
-        # 如果找到匹配的疾病且置信度足够高
-        if best_match and best_score > 0.6:
-            return {
-                "disease": best_match,
-                "confidence": min(best_score, 0.95)  # 最高95%，保留改进空间
-            }
-        else:
-            # 默认返回高血压，置信度较低
-            return {
-                "disease": "高血压",
-                "confidence": 0.75  # 默认置信度
-            }
+            disease = self.reverse_label_map[predicted_idx.item()]
+            confidence_value = confidence.item()
+
+        return {
+            "disease": disease,
+            "confidence": confidence_value
+        }
 
     async def calculate_symptom_match(self, complaint, symptoms):
         """计算症状匹配度 (Calculate symptom match score)"""
@@ -1319,29 +1361,118 @@ async def train_model(config, knowledge_base):
     """训练医疗诊断模型"""
     logger.info("开始训练医疗诊断模型 | Starting medical diagnosis model training...")
 
-    # 这里应该是实际的数据准备和训练过程
-    # 简化版：模拟训练过程
+    # 准备训练数据
+    texts, labels, label_map = knowledge_base.prepare_training_data()
 
+    if len(texts) == 0:
+        logger.error("没有足够的训练数据 | Not enough training data")
+        return None, None, None, None
+
+    # 划分训练集和验证集
+    train_texts, val_texts, train_labels, val_labels = train_test_split(
+        texts, labels, test_size=0.2, random_state=42, stratify=labels
+    )
+
+    # 初始化tokenizer
+    tokenizer = BertTokenizer.from_pretrained(config.pretrained_model_name)
+
+    # 创建数据集
+    train_dataset = MedicalDataset(train_texts, train_labels, tokenizer, config.max_seq_length)
+    val_dataset = MedicalDataset(val_texts, val_labels, tokenizer, config.max_seq_length)
+
+    # 创建数据加载器
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False)
+
+    # 初始化模型
+    model = MedicalAIModel(config, len(label_map))
+
+    # 设置设备
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+
+    # 设置优化器和学习率调度器
+    optimizer = AdamW(model.parameters(), lr=config.learning_rate)
+    total_steps = len(train_loader) * config.epochs
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=config.warmup_steps,
+        num_training_steps=total_steps
+    )
+
+    # 损失函数
+    criterion = nn.CrossEntropyLoss()
+
+    # 训练监控器
     monitor = TrainingMonitor(config)
 
-    # 模拟训练过程
+    # 训练循环
     for epoch in range(config.epochs):
-        # 模拟训练指标
-        train_loss = 0.5 * (0.9 ** epoch)
-        val_loss = 0.6 * (0.9 ** epoch)
-        train_acc = 0.7 + 0.2 * (1 - 0.9 ** epoch)
-        val_acc = 0.65 + 0.2 * (1 - 0.9 ** epoch)
-        lr = config.learning_rate * (0.95 ** epoch)
+        # 训练阶段
+        model.train()
+        total_train_loss = 0
+        train_predictions = []
+        train_true_labels = []
+
+        for batch in train_loader:
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            labels = batch['labels'].to(device)
+
+            optimizer.zero_grad()
+
+            outputs = model(input_ids, attention_mask)
+            loss = criterion(outputs, labels)
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.max_grad_norm)
+            optimizer.step()
+            scheduler.step()
+
+            total_train_loss += loss.item()
+
+            # 收集预测结果
+            _, preds = torch.max(outputs, dim=1)
+            train_predictions.extend(preds.cpu().tolist())
+            train_true_labels.extend(labels.cpu().tolist())
+
+        # 计算训练指标
+        avg_train_loss = total_train_loss / len(train_loader)
+        train_accuracy = accuracy_score(train_true_labels, train_predictions)
+
+        # 验证阶段
+        model.eval()
+        total_val_loss = 0
+        val_predictions = []
+        val_true_labels = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = batch['labels'].to(device)
+
+                outputs = model(input_ids, attention_mask)
+                loss = criterion(outputs, labels)
+
+                total_val_loss += loss.item()
+
+                # 收集预测结果
+                _, preds = torch.max(outputs, dim=1)
+                val_predictions.extend(preds.cpu().tolist())
+                val_true_labels.extend(labels.cpu().tolist())
+
+        # 计算验证指标
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_accuracy = accuracy_score(val_true_labels, val_predictions)
 
         # 更新监控器
-        monitor.update(train_loss, val_loss, train_acc, val_acc, lr)
+        current_lr = scheduler.get_last_lr()[0]
+        monitor.update(avg_train_loss, avg_val_loss, train_accuracy, val_accuracy, current_lr)
 
         logger.info(f"Epoch {epoch + 1}/{config.epochs} - "
-                    f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
-                    f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
-
-        # 模拟GPU训练
-        await asyncio.sleep(0.5)  # 模拟训练时间
+                    f"Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
+                    f"Train Acc: {train_accuracy:.4f}, Val Acc: {val_accuracy:.4f}")
 
     # 保存学习曲线
     learning_curve_path = monitor.plot_learning_curves()
@@ -1349,11 +1480,10 @@ async def train_model(config, knowledge_base):
 
     # 保存模型
     model_path = os.path.join(config.model_dir, "diagnosis_model.pth")
-    # 这里应该是实际的模型保存代码
-    # torch.save(model.state_dict(), model_path)
+    torch.save(model.state_dict(), model_path)
     logger.info(f"模型已保存 | Model saved: {model_path}")
 
-    return monitor
+    return model, tokenizer, label_map, monitor
 
 
 # ========== 主函数 ==========
@@ -1363,16 +1493,28 @@ async def main():
         config = MedicalConfig()
 
         # 加载知识库
-        logger.info("\n[1/3] 加载医疗知识 | Loading medical knowledge...")
+        logger.info("\n[1/4] 加载医疗知识 | Loading medical knowledge...")
         knowledge_base = MedicalKnowledgeBase(config)
 
+        # 准备训练数据
+        logger.info("\n[2/4] 准备训练数据 | Preparing training data...")
+        texts, labels, label_map = knowledge_base.prepare_training_data()
+
+        if len(texts) == 0:
+            logger.error("没有足够的训练数据，请确保知识库中有足够的医疗信息")
+            return
+
         # 训练模型
-        logger.info("\n[2/3] 训练医疗诊断模型 | Training medical diagnosis model...")
-        monitor = await train_model(config, knowledge_base)
+        logger.info("\n[3/4] 训练医疗诊断模型 | Training medical diagnosis model...")
+        model, tokenizer, label_map, monitor = await train_model(config, knowledge_base)
+
+        if model is None:
+            logger.error("模型训练失败")
+            return
 
         # 初始化医疗助手
-        logger.info("\n[3/3] 启动医疗助手 | Starting Medical Assistant")
-        assistant = MedicalAssistant(knowledge_base, config)
+        logger.info("\n[4/4] 启动医疗助手 | Starting Medical Assistant")
+        assistant = MedicalAssistant(knowledge_base, config, model, tokenizer, label_map)
 
         # 交互界面
         logger.info("\n=== 医疗诊断助手 (医生版) | MEDICAL DIAGNOSTIC ASSISTANT (FOR PHYSICIANS) ===")
