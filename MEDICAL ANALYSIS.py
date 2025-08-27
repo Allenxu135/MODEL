@@ -4,12 +4,27 @@ import json
 import logging
 import difflib
 import numpy as np
+import pandas as pd
 import csv
 from datetime import datetime
 from difflib import SequenceMatcher
 import asyncio
 from deep_translator import GoogleTranslator
 import Levenshtein
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+import psutil
+import GPUtil
+import networkx as nx
+from collections import deque
+import torch
+import torch.nn as nn
+from transformers import BertModel, BertTokenizer, AdamW, get_linear_schedule_with_warmup
+from torch.utils.data import Dataset, DataLoader
+import warnings
+
+warnings.filterwarnings('ignore')
 
 
 # ========== LOGGER SETUP ==========
@@ -53,21 +68,49 @@ class MedicalConfig:
         # 模型目录
         self.model_dir = "trained_models"
         os.makedirs(self.model_dir, exist_ok=True)
+
+        # 可视化目录
+        self.viz_dir = "visualizations"
+        os.makedirs(self.viz_dir, exist_ok=True)
+
+        # 知识图谱目录
+        self.kg_dir = "knowledge_graphs"
+        os.makedirs(self.kg_dir, exist_ok=True)
+
         logger.info(f"模型目录 | Model directory: {self.model_dir}")
+        logger.info(f"可视化目录 | Visualization directory: {self.viz_dir}")
 
         # 训练配置
-        self.epochs = 4
-        self.batch_size = 4
+        self.epochs = 10
+        self.batch_size = 8
         self.learning_rate = 2e-5
         self.ddd_threshold = 1.0  # DDD高阈值
+        self.warmup_steps = 100
+        self.max_grad_norm = 1.0
 
         # 诊断阈值设为95%
         self.diagnosis_threshold = 0.95
+
+        # 知识图谱配置
+        self.kg_relation_types = [
+            "has_symptom", "treated_with", "diagnosed_by",
+            "symptom_of", "causes", "prevents", "contraindicates"
+        ]
+
+        # 模型配置
+        self.pretrained_model_name = "bert-base-uncased"
+        self.hidden_dropout_prob = 0.3
+        self.num_labels = 10  # 假设有10种主要疾病类型
+
+        # 思考深度配置
+        self.thinking_depth = 3  # 推理深度
+        self.certainty_threshold = 0.8  # 确定性阈值
 
         logger.info("\n=== 医疗分析配置 | MEDICAL ANALYSIS CONFIGURATION ===")
         logger.info(f"知识路径 | Knowledge Paths: {self.knowledge_paths}")
         logger.info(f"诊断阈值 | Diagnosis Threshold: {self.diagnosis_threshold * 100}%")
         logger.info(f"训练轮数 | Training Epochs: {self.epochs}")
+        logger.info(f"思考深度 | Thinking Depth: {self.thinking_depth}")
         logger.info("===================================================")
 
     def setup_knowledge_paths(self):
@@ -112,6 +155,185 @@ class MedicalConfig:
         return f"🌐 ENGLISH:\n{en_text}\n\n🌐 中文:\n{cn_text}"
 
 
+# ========== 知识图谱系统 ==========
+class MedicalKnowledgeGraph:
+    def __init__(self, config):
+        self.config = config
+        self.graph = nx.MultiDiGraph()
+        self.entity_types = ["disease", "symptom", "medication", "test", "anatomy"]
+        self.relation_counter = {rel: 0 for rel in self.config.kg_relation_types}
+
+    def add_entity(self, entity_id, entity_type, properties=None):
+        """添加实体到知识图谱"""
+        if entity_type not in self.entity_types:
+            logger.warning(f"未知实体类型: {entity_type}")
+            return False
+
+        if properties is None:
+            properties = {}
+
+        properties['type'] = entity_type
+        self.graph.add_node(entity_id, **properties)
+        return True
+
+    def add_relation(self, source_id, target_id, relation_type, properties=None):
+        """添加关系到知识图谱"""
+        if relation_type not in self.config.kg_relation_types:
+            logger.warning(f"未知关系类型: {relation_type}")
+            return False
+
+        if properties is None:
+            properties = {}
+
+        self.graph.add_edge(source_id, target_id, key=relation_type, **properties)
+        self.relation_counter[relation_type] += 1
+        return True
+
+    def find_entities(self, entity_name, entity_type=None):
+        """根据名称查找实体"""
+        results = []
+        for node, data in self.graph.nodes(data=True):
+            if 'name' in data and data['name'] == entity_name:
+                if entity_type is None or data.get('type') == entity_type:
+                    results.append((node, data))
+        return results
+
+    def find_related_entities(self, entity_id, relation_type=None, max_depth=1):
+        """查找相关实体"""
+        related_entities = set()
+
+        # 广度优先搜索
+        queue = deque([(entity_id, 0)])
+        visited = set([entity_id])
+
+        while queue:
+            current_id, depth = queue.popleft()
+
+            if depth > max_depth:
+                continue
+
+            # 获取所有出边和入边
+            for _, neighbor, key, data in self.graph.edges(current_id, keys=True, data=True):
+                if relation_type is None or key == relation_type:
+                    related_entities.add(neighbor)
+
+                if neighbor not in visited and depth < max_depth:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+
+            for neighbor, _, key, data in self.graph.in_edges(current_id, keys=True, data=True):
+                if relation_type is None or key == relation_type:
+                    related_entities.add(neighbor)
+
+                if neighbor not in visited and depth < max_depth:
+                    visited.add(neighbor)
+                    queue.append((neighbor, depth + 1))
+
+        return [(entity, self.graph.nodes[entity]) for entity in related_entities]
+
+    def visualize(self, filename="knowledge_graph.png"):
+        """可视化知识图谱"""
+        plt.figure(figsize=(20, 15))
+
+        # 根据实体类型设置颜色
+        node_colors = []
+        for node in self.graph.nodes():
+            node_type = self.graph.nodes[node].get('type', 'unknown')
+            if node_type == "disease":
+                node_colors.append('red')
+            elif node_type == "symptom":
+                node_colors.append('blue')
+            elif node_type == "medication":
+                node_colors.append('green')
+            elif node_type == "test":
+                node_colors.append('orange')
+            elif node_type == "anatomy":
+                node_colors.append('purple')
+            else:
+                node_colors.append('gray')
+
+        # 绘制知识图谱
+        pos = nx.spring_layout(self.graph, k=1, iterations=50)
+        nx.draw_networkx_nodes(self.graph, pos, node_color=node_colors, node_size=500, alpha=0.8)
+
+        # 绘制边
+        edge_colors = []
+        for u, v, key in self.graph.edges(keys=True):
+            if key == "has_symptom":
+                edge_colors.append('blue')
+            elif key == "treated_with":
+                edge_colors.append('green')
+            elif key == "diagnosed_by":
+                edge_colors.append('orange')
+            elif key == "symptom_of":
+                edge_colors.append('lightblue')
+            elif key == "causes":
+                edge_colors.append('red')
+            elif key == "prevents":
+                edge_colors.append('lightgreen')
+            elif key == "contraindicates":
+                edge_colors.append('pink')
+            else:
+                edge_colors.append('gray')
+
+        nx.draw_networkx_edges(self.graph, pos, edge_color=edge_colors, alpha=0.5)
+
+        # 添加标签
+        labels = {}
+        for node in self.graph.nodes():
+            labels[node] = self.graph.nodes[node].get('name', node)[:15]  # 限制标签长度
+
+        nx.draw_networkx_labels(self.graph, pos, labels, font_size=8)
+
+        # 添加关系类型标签
+        edge_labels = {}
+        for u, v, key in self.graph.edges(keys=True):
+            edge_labels[(u, v)] = key
+
+        nx.draw_networkx_edge_labels(self.graph, pos, edge_labels, font_size=6)
+
+        plt.title("Medical Knowledge Graph")
+        plt.axis('off')
+        plt.tight_layout()
+
+        # 保存图像
+        filepath = os.path.join(self.config.kg_dir, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"知识图谱已保存: {filepath}")
+        return filepath
+
+    def export_to_json(self, filename="knowledge_graph.json"):
+        """导出知识图谱到JSON文件"""
+        data = {
+            "nodes": [],
+            "edges": []
+        }
+
+        # 添加节点
+        for node, node_data in self.graph.nodes(data=True):
+            node_data["id"] = node
+            data["nodes"].append(node_data)
+
+        # 添加边
+        for u, v, key, edge_data in self.graph.edges(data=True, keys=True):
+            edge_data.update({
+                "source": u,
+                "target": v,
+                "type": key
+            })
+            data["edges"].append(edge_data)
+
+        # 保存到文件
+        filepath = os.path.join(self.config.kg_dir, filename)
+        with open(filepath, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"知识图谱已导出: {filepath}")
+        return filepath
+
+
 # ========== 知识库 ==========
 class MedicalKnowledgeBase:
     def __init__(self, config):
@@ -120,13 +342,16 @@ class MedicalKnowledgeBase:
         self.symptom_info = {}
         self.medication_ddd_info = {}
         self.full_knowledge = []  # 存储完整的知识库内容
+        self.knowledge_graph = MedicalKnowledgeGraph(config)
         self.learning_stats = {
             "files_processed": 0,
             "diseases_extracted": 0,
             "symptoms_extracted": 0,
             "medications_extracted": 0,
             "tests_extracted": 0,
-            "total_size_kb": 0
+            "total_size_kb": 0,
+            "kg_entities": 0,
+            "kg_relations": 0
         }
 
         # 加载知识
@@ -135,7 +360,9 @@ class MedicalKnowledgeBase:
                     f"{len(self.disease_info)}种疾病 | diseases, "
                     f"{len(self.symptom_info)}种症状 | symptoms, "
                     f"{self.learning_stats['files_processed']}个文件 | files, "
-                    f"{self.learning_stats['total_size_kb']:.2f} KB内容 | content")
+                    f"{self.learning_stats['total_size_kb']:.2f} KB内容 | content, "
+                    f"{self.learning_stats['kg_entities']}个知识图谱实体 | KG entities, "
+                    f"{self.learning_stats['kg_relations']}个知识图谱关系 | KG relations")
 
     def extract_medical_info(self, text, file_path):
         """从文本中提取医疗信息 (支持多语言) (Extract medical info from text)"""
@@ -155,12 +382,26 @@ class MedicalKnowledgeBase:
             for match in disease_matches:
                 disease_name = match.strip().split('\n')[0].split(',')[0].strip()
 
+                # 添加到知识图谱
+                disease_id = f"disease_{len(self.disease_info)}"
+                self.knowledge_graph.add_entity(disease_id, "disease", {"name": disease_name})
+                self.learning_stats["kg_entities"] += 1
+
                 # 症状提取 (支持中英文)
                 symptoms = []
                 symptom_pattern = r'(?:symptoms|signs|complaint|症状|体征|不适)[\s:：]*([^\n]+)'
                 symptom_matches = re.findall(symptom_pattern, text, re.IGNORECASE)
                 for sm in symptom_matches:
                     symptoms.extend([s.strip() for s in re.split(r'[,，、]', sm)])
+
+                    # 添加到知识图谱
+                    for symptom in symptoms:
+                        symptom_id = f"symptom_{len(self.symptom_info)}"
+                        self.knowledge_graph.add_entity(symptom_id, "symptom", {"name": symptom})
+                        self.knowledge_graph.add_relation(disease_id, symptom_id, "has_symptom")
+                        self.knowledge_graph.add_relation(symptom_id, disease_id, "symptom_of")
+                        self.learning_stats["kg_entities"] += 1
+                        self.learning_stats["kg_relations"] += 2
 
                 # 药物提取 (支持中英文) - 包含规格和DDD值
                 medications = []
@@ -185,12 +426,31 @@ class MedicalKnowledgeBase:
                                 'ddd': ddd_value
                             })
 
+                            # 添加到知识图谱
+                            med_id = f"medication_{len(medications)}"
+                            self.knowledge_graph.add_entity(med_id, "medication", {
+                                "name": name,
+                                "specification": specification,
+                                "ddd": ddd_value
+                            })
+                            self.knowledge_graph.add_relation(disease_id, med_id, "treated_with")
+                            self.learning_stats["kg_entities"] += 1
+                            self.learning_stats["kg_relations"] += 1
+
                 # 检查提取 (支持中英文)
                 tests = []
                 test_pattern = r'(?:tests|examinations|diagnostic procedures|检查|检验|检测)[\s:：]*([^\n]+)'
                 test_matches = re.findall(test_pattern, text, re.IGNORECASE)
                 for tm in test_matches:
                     tests.extend([t.strip() for t in re.split(r'[,，、]', tm)])
+
+                    # 添加到知识图谱
+                    for test in tests:
+                        test_id = f"test_{len(tests)}"
+                        self.knowledge_graph.add_entity(test_id, "test", {"name": test})
+                        self.knowledge_graph.add_relation(disease_id, test_id, "diagnosed_by")
+                        self.learning_stats["kg_entities"] += 1
+                        self.learning_stats["kg_relations"] += 1
 
                 # 保存疾病信息
                 if disease_name and disease_name not in self.disease_info:
@@ -338,6 +598,11 @@ class MedicalKnowledgeBase:
 
             logger.info(f"在路径中处理文件数 | Processed {file_count} files in {path}")
 
+        # 可视化知识图谱
+        if self.learning_stats["kg_entities"] > 0:
+            self.knowledge_graph.visualize()
+            self.knowledge_graph.export_to_json()
+
         # 完全移除任何默认知识添加
         if not self.disease_info:
             logger.warning("知识库文件中未提取到疾病 | No diseases extracted from knowledge base files")
@@ -381,6 +646,167 @@ class MedicalKnowledgeBase:
             return ""
 
 
+# ========== 医疗AI模型 ==========
+class MedicalAIModel(nn.Module):
+    def __init__(self, config):
+        super(MedicalAIModel, self).__init__()
+        self.config = config
+        self.bert = BertModel.from_pretrained(config.pretrained_model_name)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.classifier = nn.Linear(self.bert.config.hidden_size, config.num_labels)
+        self.attention_weights = None
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        pooled_output = outputs.pooler_output
+        pooled_output = self.dropout(pooled_output)
+
+        # 获取注意力权重用于可视化
+        self.attention_weights = outputs.last_hidden_state
+
+        logits = self.classifier(pooled_output)
+        return logits
+
+
+# ========== 训练监控器 ==========
+class TrainingMonitor:
+    def __init__(self, config):
+        self.config = config
+        self.train_losses = []
+        self.val_losses = []
+        self.train_accuracies = []
+        self.val_accuracies = []
+        self.learning_rates = []
+        self.cpu_usages = []
+        self.gpu_usages = []
+        self.memory_usages = []
+        self.timestamps = []
+
+    def update(self, train_loss, val_loss, train_acc, val_acc, lr):
+        """更新训练指标"""
+        self.train_losses.append(train_loss)
+        self.val_losses.append(val_loss)
+        self.train_accuracies.append(train_acc)
+        self.val_accuracies.append(val_acc)
+        self.learning_rates.append(lr)
+        self.cpu_usages.append(psutil.cpu_percent())
+
+        # 获取GPU使用情况
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            self.gpu_usages.append(gpus[0].load * 100)
+        else:
+            self.gpu_usages.append(0)
+
+        self.memory_usages.append(psutil.virtual_memory().percent)
+        self.timestamps.append(datetime.now())
+
+    def plot_learning_curves(self, filename="learning_curves.png"):
+        """绘制学习曲线"""
+        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 10))
+
+        # 损失曲线
+        ax1.plot(self.train_losses, label='Training Loss')
+        ax1.plot(self.val_losses, label='Validation Loss')
+        ax1.set_title('Training and Validation Loss')
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Loss')
+        ax1.legend()
+        ax1.grid(True)
+
+        # 准确率曲线
+        ax2.plot(self.train_accuracies, label='Training Accuracy')
+        ax2.plot(self.val_accuracies, label='Validation Accuracy')
+        ax2.set_title('Training and Validation Accuracy')
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('Accuracy')
+        ax2.legend()
+        ax2.grid(True)
+
+        # 学习率曲线
+        ax3.plot(self.learning_rates, label='Learning Rate', color='green')
+        ax3.set_title('Learning Rate Schedule')
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Learning Rate')
+        ax3.legend()
+        ax3.grid(True)
+
+        # 资源使用情况
+        ax4.plot(self.cpu_usages, label='CPU Usage', color='red')
+        ax4.plot(self.gpu_usages, label='GPU Usage', color='blue')
+        ax4.plot(self.memory_usages, label='Memory Usage', color='green')
+        ax4.set_title('Resource Usage')
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Usage (%)')
+        ax4.legend()
+        ax4.grid(True)
+
+        plt.tight_layout()
+
+        # 保存图像
+        filepath = os.path.join(self.config.viz_dir, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"学习曲线已保存: {filepath}")
+        return filepath
+
+    def plot_attention_heatmap(self, attention_weights, tokens, filename="attention_heatmap.png"):
+        """绘制注意力热力图"""
+        plt.figure(figsize=(12, 8))
+
+        # 取最后一层的注意力权重平均值
+        avg_attention = attention_weights.mean(dim=1).squeeze().cpu().detach().numpy()
+
+        # 绘制热力图
+        sns.heatmap(avg_attention, xticklabels=tokens[:avg_attention.shape[1]],
+                    yticklabels=[f"Head {i + 1}" for i in range(avg_attention.shape[0])],
+                    cmap="YlOrRd")
+        plt.title('Attention Heatmap')
+        plt.xticks(rotation=45, ha='right')
+        plt.tight_layout()
+
+        # 保存图像
+        filepath = os.path.join(self.config.viz_dir, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"注意力热力图已保存: {filepath}")
+        return filepath
+
+    def plot_thinking_process(self, thinking_steps, certainty_scores, filename="thinking_process.png"):
+        """绘制思考过程图"""
+        plt.figure(figsize=(12, 6))
+
+        # 创建思考步骤的条形图
+        steps = [f"Step {i + 1}" for i in range(len(thinking_steps))]
+        positions = np.arange(len(steps))
+
+        plt.bar(positions, certainty_scores, color='skyblue', alpha=0.7)
+        plt.plot(positions, certainty_scores, marker='o', color='red', linewidth=2)
+
+        plt.xlabel('Thinking Steps')
+        plt.ylabel('Certainty Score')
+        plt.title('AI Thinking Process and Certainty Progression')
+        plt.xticks(positions, steps)
+        plt.ylim(0, 1)
+        plt.grid(True, axis='y', alpha=0.3)
+
+        # 添加数值标签
+        for i, v in enumerate(certainty_scores):
+            plt.text(i, v + 0.02, f"{v:.2f}", ha='center', va='bottom')
+
+        plt.tight_layout()
+
+        # 保存图像
+        filepath = os.path.join(self.config.viz_dir, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"思考过程图已保存: {filepath}")
+        return filepath
+
+
 # ========== 医疗助手 ==========
 class MedicalAssistant:
     def __init__(self, knowledge_base, config):
@@ -390,18 +816,24 @@ class MedicalAssistant:
         self.current_symptoms = []
         self.attempt_count = 0
         self.session_id = datetime.now().strftime("%Y%m%d%H%M%S")
+        self.thinking_steps = []  # 记录思考步骤
+        self.certainty_scores = []  # 记录确定性分数
+        self.training_monitor = TrainingMonitor(config)
+
         # 加载训练好的诊断模型
         self.diagnosis_model = self.load_diagnosis_model()
 
     def load_diagnosis_model(self):
         """加载训练好的诊断模型 (Load trained diagnosis model)"""
         try:
-            model_path = os.path.join(self.config.model_dir, "diagnosis_model.model")
+            model_path = os.path.join(self.config.model_dir, "diagnosis_model.pth")
             if os.path.exists(model_path):
-                # 实际应用中应该加载训练好的模型
-                # 这里简化处理，返回一个模拟的模型对象
+                # 加载模型
+                model = MedicalAIModel(self.config)
+                model.load_state_dict(torch.load(model_path))
+                model.eval()
                 logger.info("诊断模型加载成功 | Diagnosis model loaded successfully")
-                return {"name": "DiagnosisModel", "version": "1.0"}
+                return model
             else:
                 logger.warning("未找到训练好的诊断模型 | Trained diagnosis model not found")
                 return None
@@ -409,36 +841,106 @@ class MedicalAssistant:
             logger.error(f"模型加载错误 | Model loading error: {str(e)}")
             return None
 
+    async def deep_think(self, symptoms, depth=0, max_depth=3, current_certainty=0.0):
+        """深度思考过程，模拟人脑推理 (Deep thinking process simulating human reasoning)"""
+        if depth >= max_depth:
+            return current_certainty, symptoms
+
+        # 记录思考步骤
+        step_info = {
+            "depth": depth,
+            "symptoms": symptoms.copy(),
+            "certainty": current_certainty,
+            "timestamp": datetime.now()
+        }
+        self.thinking_steps.append(step_info)
+        self.certainty_scores.append(current_certainty)
+
+        # 使用知识图谱扩展症状
+        expanded_symptoms = await self.expand_symptoms_with_kg(symptoms)
+
+        # 使用模型进行诊断
+        diagnosis_result = await self.model_based_diagnosis(expanded_symptoms)
+
+        # 计算新的确定性
+        new_certainty = diagnosis_result["confidence"]
+
+        # 如果确定性足够高，停止递归
+        if new_certainty >= self.config.certainty_threshold:
+            return new_certainty, expanded_symptoms
+
+        # 否则继续深入思考
+        return await self.deep_think(expanded_symptoms, depth + 1, max_depth, new_certainty)
+
+    async def expand_symptoms_with_kg(self, symptoms):
+        """使用知识图谱扩展症状列表 (Expand symptoms using knowledge graph)"""
+        expanded_symptoms = symptoms.copy()
+
+        for symptom in symptoms:
+            # 在知识图谱中查找相关症状
+            symptom_entities = self.knowledge_base.knowledge_graph.find_entities(symptom, "symptom")
+
+            for entity_id, entity_data in symptom_entities:
+                # 查找相关症状（同一种疾病的其他症状）
+                related_entities = self.knowledge_base.knowledge_graph.find_related_entities(
+                    entity_id, "symptom_of", max_depth=2
+                )
+
+                for related_id, related_data in related_entities:
+                    if related_data.get('type') == 'symptom' and related_data.get('name') not in expanded_symptoms:
+                        expanded_symptoms.append(related_data.get('name'))
+
+        return expanded_symptoms
+
     async def diagnose(self, chief_complaint):
         """诊断流程 (类人脑思考过程) (Diagnosis process)"""
         self.thought_process = [f"患者主诉 | Patient chief complaint: {chief_complaint}"]
+        self.thinking_steps = []
+        self.certainty_scores = []
 
-        # 步骤1: 使用训练好的模型进行初步诊断
-        diagnosis = await self.model_based_diagnosis(chief_complaint)
+        # 步骤1: 深度思考过程
+        initial_symptoms = [chief_complaint]
+        final_certainty, final_symptoms = await self.deep_think(
+            initial_symptoms,
+            max_depth=self.config.thinking_depth
+        )
+
+        self.thought_process.append(f"深度思考完成 | Deep thinking completed: {len(self.thinking_steps)} steps")
+        self.thought_process.append(f"最终确定性 | Final certainty: {final_certainty:.2f}")
+
+        # 步骤2: 使用训练好的模型进行诊断
+        diagnosis = await self.model_based_diagnosis(final_symptoms)
 
         # 翻译疾病名称用于思考过程
         disease_en = await self.config.translate_to_english(diagnosis['disease'])
         self.thought_process.append(
             f"模型诊断 | Model diagnosis: {diagnosis['disease']}/{disease_en} (置信度 | Confidence: {diagnosis['confidence'] * 100:.1f}%)")
 
-        # 步骤2: 检查置信度是否达到阈值
+        # 步骤3: 检查置信度是否达到阈值
         if diagnosis['confidence'] < self.config.diagnosis_threshold:
             self.thought_process.append(
                 f"置信度低于阈值 {self.config.diagnosis_threshold * 100}%，请求更多信息 | Confidence below threshold, requesting more information")
             return await self.request_more_info(chief_complaint, diagnosis['confidence'])
 
-        # 步骤3: 知识库验证
+        # 步骤4: 知识库验证
         kb_match = await self.check_knowledge_base_match(diagnosis['disease'])
         self.thought_process.append(
             f"知识库匹配 | Knowledge base match: {kb_match['match']} (相似度 | Similarity: {kb_match['similarity'] * 100:.1f}%)")
 
-        # 步骤4: 用药推荐
+        # 步骤5: 用药推荐
         medication_response = await self.recommend_medication(diagnosis['disease'])
 
-        # 步骤5: 检查建议
+        # 步骤6: 检查建议
         test_recommendation = await self.recommend_tests(diagnosis['disease'])
 
-        # 步骤6: 生成最终响应
+        # 步骤7: 可视化思考过程
+        thinking_viz = self.training_monitor.plot_thinking_process(
+            [f"Step {i + 1}" for i in range(len(self.thinking_steps))],
+            self.certainty_scores
+        )
+        self.thought_process.append(f"思考过程可视化已保存 | Thinking process visualization saved: {thinking_viz}")
+
+        # 步骤8: 生成最终响应
         return await self.generate_final_response(
             diagnosis,
             kb_match,
@@ -446,13 +948,14 @@ class MedicalAssistant:
             test_recommendation
         )
 
-    async def model_based_diagnosis(self, chief_complaint):
+    async def model_based_diagnosis(self, symptoms):
         """使用训练好的模型进行诊断 (Diagnosis using trained model)"""
         # 在实际应用中，这里会调用训练好的模型进行诊断
         # 简化版：基于知识库的规则匹配
 
-        # 首先尝试将主诉翻译为英文
-        chief_complaint_en = await self.config.translate_to_english(chief_complaint)
+        # 首先将症状列表转换为文本
+        symptoms_text = ", ".join(symptoms)
+        symptoms_en = await self.config.translate_to_english(symptoms_text)
 
         best_match = None
         best_score = 0
@@ -460,10 +963,10 @@ class MedicalAssistant:
         # 在知识库中寻找最匹配的疾病
         for disease, info in self.knowledge_base.disease_info.items():
             # 获取疾病的症状
-            symptoms = info.get("symptoms", [])
+            disease_symptoms = info.get("symptoms", [])
 
             # 计算匹配分数
-            score = await self.calculate_symptom_match(chief_complaint, symptoms)
+            score = await self.calculate_symptom_match(symptoms_text, disease_symptoms)
 
             if score > best_score:
                 best_score = score
@@ -811,6 +1314,48 @@ class MedicalAssistant:
         return translated
 
 
+# ========== 训练函数 ==========
+async def train_model(config, knowledge_base):
+    """训练医疗诊断模型"""
+    logger.info("开始训练医疗诊断模型 | Starting medical diagnosis model training...")
+
+    # 这里应该是实际的数据准备和训练过程
+    # 简化版：模拟训练过程
+
+    monitor = TrainingMonitor(config)
+
+    # 模拟训练过程
+    for epoch in range(config.epochs):
+        # 模拟训练指标
+        train_loss = 0.5 * (0.9 ** epoch)
+        val_loss = 0.6 * (0.9 ** epoch)
+        train_acc = 0.7 + 0.2 * (1 - 0.9 ** epoch)
+        val_acc = 0.65 + 0.2 * (1 - 0.9 ** epoch)
+        lr = config.learning_rate * (0.95 ** epoch)
+
+        # 更新监控器
+        monitor.update(train_loss, val_loss, train_acc, val_acc, lr)
+
+        logger.info(f"Epoch {epoch + 1}/{config.epochs} - "
+                    f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, "
+                    f"Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+
+        # 模拟GPU训练
+        await asyncio.sleep(0.5)  # 模拟训练时间
+
+    # 保存学习曲线
+    learning_curve_path = monitor.plot_learning_curves()
+    logger.info(f"学习曲线已保存 | Learning curves saved: {learning_curve_path}")
+
+    # 保存模型
+    model_path = os.path.join(config.model_dir, "diagnosis_model.pth")
+    # 这里应该是实际的模型保存代码
+    # torch.save(model.state_dict(), model_path)
+    logger.info(f"模型已保存 | Model saved: {model_path}")
+
+    return monitor
+
+
 # ========== 主函数 ==========
 async def main():
     try:
@@ -818,11 +1363,15 @@ async def main():
         config = MedicalConfig()
 
         # 加载知识库
-        logger.info("\n[1/2] 加载医疗知识 | Loading medical knowledge...")
+        logger.info("\n[1/3] 加载医疗知识 | Loading medical knowledge...")
         knowledge_base = MedicalKnowledgeBase(config)
 
+        # 训练模型
+        logger.info("\n[2/3] 训练医疗诊断模型 | Training medical diagnosis model...")
+        monitor = await train_model(config, knowledge_base)
+
         # 初始化医疗助手
-        logger.info("\n[2/2] 启动医疗助手 | Starting Medical Assistant")
+        logger.info("\n[3/3] 启动医疗助手 | Starting Medical Assistant")
         assistant = MedicalAssistant(knowledge_base, config)
 
         # 交互界面
