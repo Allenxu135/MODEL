@@ -29,6 +29,8 @@ import warnings
 import faiss
 from sentence_transformers import SentenceTransformer
 import ollama
+import pickle
+from py2neo import Graph, Node, Relationship
 
 warnings.filterwarnings('ignore')
 
@@ -73,6 +75,8 @@ class MedicalConfig:
         os.makedirs(self.kg_dir, exist_ok=True)
         self.data_dir = "data"
         os.makedirs(self.data_dir, exist_ok=True)
+        self.neo4j_dir = "neo4j_data"
+        os.makedirs(self.neo4j_dir, exist_ok=True)
 
         logger.info(f"模型目录: {self.model_dir}")
         logger.info(f"可视化目录: {self.viz_dir}")
@@ -110,12 +114,19 @@ class MedicalConfig:
         self.faiss_index_path = os.path.join(self.model_dir, "faiss_index.bin")
         self.embedding_model = "all-MiniLM-L6-v2"
 
+        # Neo4j配置
+        self.neo4j_uri = "bolt://localhost:7687"
+        self.neo4j_user = "neo4j"
+        self.neo4j_password = "password"
+        self.use_neo4j = False  # 默认不使用Neo4j，使用本地图谱
+
         logger.info("\n=== 医疗分析配置 ===")
         logger.info(f"知识路径: {self.knowledge_paths}")
         logger.info(f"诊断阈值: {self.diagnosis_threshold * 100}%")
         logger.info(f"训练轮数: {self.epochs}")
         logger.info(f"思考深度: {self.thinking_depth}")
         logger.info(f"OLLAMA模型: {self.ollama_model}")
+        logger.info(f"使用Neo4j: {self.use_neo4j}")
         logger.info("===================================")
 
     def setup_knowledge_paths(self):
@@ -214,13 +225,18 @@ class FAISSVectorDB:
         return results
 
 
-# ========== 知识图谱系统 ==========
-class MedicalKnowledgeGraph:
+# ========== 本地知识图谱系统 ==========
+class LocalKnowledgeGraph:
+    """本地知识图谱实现，不依赖外部数据库"""
+
     def __init__(self, config):
         self.config = config
         self.graph = nx.MultiDiGraph()
         self.entity_types = ["disease", "symptom", "medication", "test", "anatomy"]
         self.relation_counter = {rel: 0 for rel in self.config.kg_relation_types}
+        self.entity_dict = {}  # 实体ID到实体的映射
+        self.entity_name_to_id = {}  # 实体名称到ID的映射
+        self.graph_file = os.path.join(config.neo4j_dir, "local_knowledge_graph.pkl")
 
     def add_entity(self, entity_id, entity_type, properties=None):
         """添加实体到知识图谱"""
@@ -233,6 +249,12 @@ class MedicalKnowledgeGraph:
 
         properties['type'] = entity_type
         self.graph.add_node(entity_id, **properties)
+
+        # 更新映射
+        self.entity_dict[entity_id] = properties
+        if 'name' in properties:
+            self.entity_name_to_id[properties['name']] = entity_id
+
         return True
 
     def add_relation(self, source_id, target_id, relation_type, properties=None):
@@ -252,7 +274,9 @@ class MedicalKnowledgeGraph:
         """根据名称查找实体"""
         results = []
         for node, data in self.graph.nodes(data=True):
-            if 'name' in data and data['name'] == entity_name:
+            if 'name' in data and (entity_name.lower() in data['name'].lower() or
+                                   difflib.SequenceMatcher(None, entity_name.lower(),
+                                                           data['name'].lower()).ratio() > 0.7):
                 if entity_type is None or data.get('type') == entity_type:
                     results.append((node, data))
         return results
@@ -390,6 +414,160 @@ class MedicalKnowledgeGraph:
         logger.info(f"知识图谱已导出: {filepath}")
         return filepath
 
+    def save(self):
+        """保存知识图谱到文件"""
+        graph_data = {
+            'graph': self.graph,
+            'entity_dict': self.entity_dict,
+            'entity_name_to_id': self.entity_name_to_id,
+            'relation_counter': self.relation_counter
+        }
+
+        with open(self.graph_file, 'wb') as f:
+            pickle.dump(graph_data, f)
+
+        logger.info(f"知识图谱已保存到: {self.graph_file}")
+
+    def load(self):
+        """从文件加载知识图谱"""
+        if os.path.exists(self.graph_file):
+            with open(self.graph_file, 'rb') as f:
+                graph_data = pickle.load(f)
+
+            self.graph = graph_data['graph']
+            self.entity_dict = graph_data['entity_dict']
+            self.entity_name_to_id = graph_data['entity_name_to_id']
+            self.relation_counter = graph_data['relation_counter']
+
+            logger.info(f"知识图谱已从 {self.graph_file} 加载")
+            return True
+        return False
+
+    def cypher_query(self, query):
+        """模拟Cypher查询，用于本地知识图谱"""
+        # 简单的查询解析，支持基本模式匹配
+        if "MATCH" in query and "RETURN" in query:
+            # 提取模式部分
+            match_part = query.split("MATCH")[1].split("RETURN")[0].strip()
+
+            # 简单的关系模式匹配 (a)-[r]->(b)
+            if ")-[" in match_part and "]->(" in match_part:
+                parts = match_part.split(")-[")
+                left_entity = parts[0].replace("(", "").strip()
+
+                rel_parts = parts[1].split("]->")
+                rel_type = rel_parts[0].replace(":", "").replace("]", "").strip()
+
+                right_entity = rel_parts[1].replace(")", "").strip()
+
+                # 执行查询
+                results = []
+                for node_id, node_data in self.graph.nodes(data=True):
+                    if left_entity in node_data.get('type', '') or left_entity == node_id:
+                        for _, neighbor, key, edge_data in self.graph.edges(node_id, keys=True, data=True):
+                            if key == rel_type:
+                                neighbor_data = self.graph.nodes[neighbor]
+                                if right_entity in neighbor_data.get('type', '') or right_entity == neighbor:
+                                    results.append({
+                                        left_entity: node_data,
+                                        rel_type: edge_data,
+                                        right_entity: neighbor_data
+                                    })
+
+                return results
+
+        # 默认返回空结果
+        return []
+
+
+# ========== Neo4j知识图谱系统 ==========
+class Neo4jKnowledgeGraph:
+    """Neo4j知识图谱实现，需要安装Neo4j数据库"""
+
+    def __init__(self, config):
+        self.config = config
+        self.graph = None
+        self.connected = False
+
+        if config.use_neo4j:
+            self.connect()
+
+    def connect(self):
+        """连接到Neo4j数据库"""
+        try:
+            self.graph = Graph(
+                self.config.neo4j_uri,
+                auth=(self.config.neo4j_user, self.config.neo4j_password)
+            )
+            self.connected = True
+            logger.info("成功连接到Neo4j数据库")
+        except Exception as e:
+            logger.error(f"连接Neo4j数据库失败: {str(e)}")
+            self.connected = False
+
+    def add_entity(self, entity_id, entity_type, properties=None):
+        """添加实体到知识图谱"""
+        if not self.connected:
+            return False
+
+        if properties is None:
+            properties = {}
+
+        properties['id'] = entity_id
+        properties['type'] = entity_type
+
+        try:
+            node = Node(entity_type, **properties)
+            self.graph.create(node)
+            return True
+        except Exception as e:
+            logger.error(f"添加实体失败: {str(e)}")
+            return False
+
+    def add_relation(self, source_id, target_id, relation_type, properties=None):
+        """添加关系到知识图谱"""
+        if not self.connected:
+            return False
+
+        if properties is None:
+            properties = {}
+
+        try:
+            query = (
+                f"MATCH (a), (b) "
+                f"WHERE a.id = '{source_id}' AND b.id = '{target_id}' "
+                f"CREATE (a)-[r:{relation_type} $props]->(b)"
+            )
+            self.graph.run(query, props=properties)
+            return True
+        except Exception as e:
+            logger.error(f"添加关系失败: {str(e)}")
+            return False
+
+    def cypher_query(self, query):
+        """执行Cypher查询"""
+        if not self.connected:
+            return []
+
+        try:
+            result = self.graph.run(query)
+            return [dict(record) for record in result]
+        except Exception as e:
+            logger.error(f"Cypher查询失败: {str(e)}")
+            return []
+
+
+# ========== 知识图谱工厂 ==========
+class KnowledgeGraphFactory:
+    """知识图谱工厂，根据配置返回适当的知识图谱实例"""
+
+    @staticmethod
+    def create_knowledge_graph(config):
+        if config.use_neo4j:
+            return Neo4jKnowledgeGraph(config)
+        else:
+            return LocalKnowledgeGraph(config)
+
 
 # ========== 医疗数据集 ==========
 class MedicalDataset(Dataset):
@@ -431,7 +609,7 @@ class MedicalKnowledgeBase:
         self.symptom_info = {}
         self.medication_ddd_info = {}
         self.full_knowledge = []
-        self.knowledge_graph = MedicalKnowledgeGraph(config)
+        self.knowledge_graph = KnowledgeGraphFactory.create_knowledge_graph(config)
         self.faiss_db = FAISSVectorDB(config)
         self.learning_stats = {
             "files_processed": 0,
@@ -645,6 +823,12 @@ class MedicalKnowledgeBase:
         """从知识库文件夹加载所有知识库文件"""
         logger.info("从本地知识库文件夹加载医疗知识...")
 
+        # 尝试加载已有的知识图谱
+        if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
+            if self.knowledge_graph.load():
+                logger.info("成功加载已有的知识图谱")
+                return
+
         for path in self.config.knowledge_paths:
             if not os.path.exists(path):
                 logger.warning(f"知识路径未找到: {path}")
@@ -676,8 +860,10 @@ class MedicalKnowledgeBase:
 
         # 可视化知识图谱
         if self.learning_stats["kg_entities"] > 0:
-            self.knowledge_graph.visualize()
-            self.knowledge_graph.export_to_json()
+            if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
+                self.knowledge_graph.visualize()
+                self.knowledge_graph.export_to_json()
+                self.knowledge_graph.save()
 
         if not self.disease_info:
             logger.warning("知识库文件中未提取到疾病")
@@ -742,6 +928,28 @@ class MedicalKnowledgeBase:
     def rag_search(self, query, k=5):
         """使用RAG检索相关知识"""
         return self.faiss_db.search(query, k)
+
+    def kg_query(self, query):
+        """执行知识图谱查询"""
+        if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
+            # 本地知识图谱查询
+            if "MATCH" in query.upper():
+                return self.knowledge_graph.cypher_query(query)
+            else:
+                # 简单关键词查询
+                results = []
+                for entity_name in self.knowledge_graph.entity_name_to_id.keys():
+                    if query.lower() in entity_name.lower():
+                        entity_id = self.knowledge_graph.entity_name_to_id[entity_name]
+                        entity_data = self.knowledge_graph.entity_dict[entity_id]
+                        results.append({
+                            'entity': entity_data,
+                            'related': self.knowledge_graph.find_related_entities(entity_id)
+                        })
+                return results
+        else:
+            # Neo4j查询
+            return self.knowledge_graph.cypher_query(query)
 
 
 # ========== 医疗AI模型 ==========
@@ -964,16 +1172,13 @@ class MedicalAssistant:
         expanded_symptoms = symptoms.copy()
 
         for symptom in symptoms:
-            symptom_entities = self.knowledge_base.knowledge_graph.find_entities(symptom, "symptom")
+            # 使用知识图谱查询相关症状
+            query = f"MATCH (s:symptom)-[:symptom_of]->(d:disease) WHERE s.name CONTAINS '{symptom}' RETURN s.name as symptom_name"
+            kg_results = self.knowledge_base.kg_query(query)
 
-            for entity_id, entity_data in symptom_entities:
-                related_entities = self.knowledge_base.knowledge_graph.find_related_entities(
-                    entity_id, "symptom_of", max_depth=2
-                )
-
-                for related_id, related_data in related_entities:
-                    if related_data.get('type') == 'symptom' and related_data.get('name') not in expanded_symptoms:
-                        expanded_symptoms.append(related_data.get('name'))
+            for result in kg_results:
+                if 'symptom_name' in result and result['symptom_name'] not in expanded_symptoms:
+                    expanded_symptoms.append(result['symptom_name'])
 
         return expanded_symptoms
 
@@ -990,7 +1195,14 @@ class MedicalAssistant:
             for i, result in enumerate(rag_results):
                 self.thought_process.append(f"相关文档 {i + 1}: {result['document'][:100]}...")
 
-        # 步骤2: 深度思考过程
+        # 步骤2: 使用知识图谱查询相关信息
+        kg_results = self.knowledge_base.kg_query(chief_complaint)
+        if kg_results:
+            self.thought_process.append("知识图谱查询结果:")
+            for i, result in enumerate(kg_results[:3]):  # 只显示前3个结果
+                self.thought_process.append(f"知识图谱结果 {i + 1}: {str(result)[:100]}...")
+
+        # 步骤3: 深度思考过程
         initial_symptoms = [chief_complaint]
         final_certainty, final_symptoms = await self.deep_think(
             initial_symptoms,
@@ -1000,20 +1212,20 @@ class MedicalAssistant:
         self.thought_process.append(f"深度思考完成: {len(self.thinking_steps)} 步骤")
         self.thought_process.append(f"最终确定性: {final_certainty:.2f}")
 
-        # 步骤3: 使用训练好的模型进行诊断
+        # 步骤4: 使用训练好的模型进行诊断
         diagnosis = await self.model_based_diagnosis(final_symptoms)
 
         disease_en = await self.config.translate_to_english(diagnosis['disease'])
         self.thought_process.append(
             f"模型诊断: {diagnosis['disease']}/{disease_en} (置信度: {diagnosis['confidence'] * 100:.1f}%)")
 
-        # 步骤4: 用药推荐
+        # 步骤5: 用药推荐
         medication_response = await self.recommend_medication(diagnosis['disease'])
 
-        # 步骤5: 检查建议
+        # 步骤6: 检查建议
         test_recommendation = await self.recommend_tests(diagnosis['disease'])
 
-        # 步骤6: 生成最终响应
+        # 步骤7: 生成最终响应
         return await self.generate_final_response(
             diagnosis,
             medication_response,
@@ -1080,7 +1292,21 @@ class MedicalAssistant:
         self.thought_process.append(
             f"为 {disease}/{disease_en} 推荐药物...")
 
-        medications = self.knowledge_base.disease_info.get(disease, {}).get("medications", [])
+        # 使用知识图谱查询相关药物
+        query = f"MATCH (d:disease)-[:treated_with]->(m:medication) WHERE d.name CONTAINS '{disease}' RETURN m.name as medication, m.specification as specification, m.ddd as ddd"
+        kg_results = self.knowledge_base.kg_query(query)
+
+        medications = []
+        for result in kg_results:
+            medications.append({
+                'name': result.get('medication', ''),
+                'specification': result.get('specification', ''),
+                'ddd': result.get('ddd', None)
+            })
+
+        if not medications:
+            # 回退到原始方法
+            medications = self.knowledge_base.disease_info.get(disease, {}).get("medications", [])
 
         if not medications:
             return {"status": "no_medication",
@@ -1138,20 +1364,27 @@ class MedicalAssistant:
         self.thought_process.append(
             f"为 {disease}/{disease_en} 分析检查需求...")
 
-        disease_info = self.knowledge_base.disease_info.get(disease, {})
+        # 使用知识图谱查询相关检查
+        query = f"MATCH (d:disease)-[:diagnosed_by]->(t:test) WHERE d.name CONTAINS '{disease}' RETURN t.name as test"
+        kg_results = self.knowledge_base.kg_query(query)
 
-        if not disease_info:
-            self.thought_process.append(
-                f"知识库中没有关于 {disease}/{disease_en} 的信息")
-            return None
+        tests = []
+        for result in kg_results:
+            tests.append(result.get('test', ''))
 
-        if "tests" in disease_info and disease_info["tests"]:
-            tests = disease_info["tests"]
+        if not tests:
+            # 回退到原始方法
+            disease_info = self.knowledge_base.disease_info.get(disease, {})
+            if "tests" in disease_info and disease_info["tests"]:
+                tests = disease_info["tests"]
+
+        if tests:
             self.thought_process.append(
                 f"从知识库中找到 {len(tests)} 项检查建议")
             return tests
 
-        symptoms = disease_info.get("symptoms", [])
+        # 如果没有找到检查，尝试从症状推断
+        symptoms = self.knowledge_base.disease_info.get(disease, {}).get("symptoms", [])
         inferred_tests = await self.infer_tests_from_symptoms(symptoms)
 
         if inferred_tests:
