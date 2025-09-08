@@ -30,7 +30,12 @@ import faiss
 from sentence_transformers import SentenceTransformer
 import ollama
 import pickle
-from py2neo import Graph, Node, Relationship
+import glob
+import fitz  # PyMuPDF for PDF processing
+from PIL import Image
+import pytesseract
+from bs4 import BeautifulSoup
+import xml.etree.ElementTree as ET
 
 warnings.filterwarnings('ignore')
 
@@ -66,20 +71,20 @@ logger = setup_logger()
 # ========== 配置 ==========
 class MedicalConfig:
     def __init__(self):
-        self.knowledge_paths = self.setup_knowledge_paths()
+        # 创建必要的目录
         self.model_dir = "trained_models"
-        os.makedirs(self.model_dir, exist_ok=True)
-        self.viz_dir = "visualizations"
-        os.makedirs(self.viz_dir, exist_ok=True)
+        self.viz_dir = "charts"  # 改为charts目录
         self.kg_dir = "knowledge_graphs"
-        os.makedirs(self.kg_dir, exist_ok=True)
         self.data_dir = "data"
-        os.makedirs(self.data_dir, exist_ok=True)
         self.neo4j_dir = "neo4j_data"
-        os.makedirs(self.neo4j_dir, exist_ok=True)
+        self.knowledge_base_dir = "knowledge_base"
+
+        for dir_path in [self.model_dir, self.viz_dir, self.kg_dir, self.data_dir,
+                         self.neo4j_dir, self.knowledge_base_dir]:
+            os.makedirs(dir_path, exist_ok=True)
 
         logger.info(f"模型目录: {self.model_dir}")
-        logger.info(f"可视化目录: {self.viz_dir}")
+        logger.info(f"图表目录: {self.viz_dir}")
 
         # 训练配置
         self.epochs = 10
@@ -103,38 +108,64 @@ class MedicalConfig:
         self.num_labels = 10
 
         # 思考深度配置
-        self.thinking_depth = 100  # 增加思考迭代次数
+        self.thinking_depth = 100
         self.certainty_threshold = 0.8
 
         # OLLAMA配置
-        self.ollama_model = "llama2"  # 默认使用llama2模型
+        self.ollama_model = self.detect_ollama_models()
         self.ollama_base_url = "http://localhost:11434"
 
         # FAISS配置
         self.faiss_index_path = os.path.join(self.model_dir, "faiss_index.bin")
         self.embedding_model = "all-MiniLM-L6-v2"
 
-        # Neo4j配置
-        self.neo4j_uri = "bolt://localhost:7687"
-        self.neo4j_user = "neo4j"
-        self.neo4j_password = "password"
-        self.use_neo4j = False  # 默认不使用Neo4j，使用本地图谱
+        # 知识图谱构建方式
+        self.kg_build_method = "auto"  # "auto" 或 "import"
 
         logger.info("\n=== 医疗分析配置 ===")
-        logger.info(f"知识路径: {self.knowledge_paths}")
+        logger.info(f"图表目录: {self.viz_dir}")
         logger.info(f"诊断阈值: {self.diagnosis_threshold * 100}%")
         logger.info(f"训练轮数: {self.epochs}")
         logger.info(f"思考深度: {self.thinking_depth}")
         logger.info(f"OLLAMA模型: {self.ollama_model}")
-        logger.info(f"使用Neo4j: {self.use_neo4j}")
+        logger.info(f"知识图谱构建方式: {self.kg_build_method}")
         logger.info("===================================")
 
-    def setup_knowledge_paths(self):
-        """设置知识库路径"""
-        knowledge_dir = os.path.join(os.getcwd(), "knowledge_base")
-        os.makedirs(knowledge_dir, exist_ok=True)
-        logger.info(f"知识路径: {knowledge_dir}")
-        return [knowledge_dir]
+    def detect_ollama_models(self):
+        """检测本地可用的OLLAMA模型"""
+        try:
+            # 获取可用模型列表
+            models = ollama.list()
+            if models and 'models' in models:
+                available_models = [model['name'] for model in models['models']]
+                logger.info(f"检测到可用OLLAMA模型: {available_models}")
+
+                # 优先选择医疗相关模型
+                medical_models = [model for model in available_models
+                                  if any(keyword in model.lower() for keyword in
+                                         ['med', 'health', 'bio', 'science'])]
+
+                if medical_models:
+                    return medical_models[0]
+
+                # 如果没有医疗相关模型，选择较大的通用模型
+                if available_models:
+                    # 优先选择较大的模型
+                    model_sizes = {
+                        'llama2': 1, 'codellama': 2, 'mistral': 3,
+                        'mixtral': 4, 'phi': 5, 'gemma': 6
+                    }
+
+                    sorted_models = sorted(available_models,
+                                           key=lambda x: model_sizes.get(x.split(':')[0], 0),
+                                           reverse=True)
+                    return sorted_models[0]
+
+            # 默认模型
+            return "llama2"
+        except Exception as e:
+            logger.error(f"检测OLLAMA模型失败: {str(e)}")
+            return "llama2"
 
     async def translate_to_english(self, text):
         """异步翻译文本到英文"""
@@ -167,6 +198,70 @@ class MedicalConfig:
     async def translate_bilingual(self, en_text, cn_text):
         """创建双语文本"""
         return f"🌐 ENGLISH:\n{en_text}\n\n🌐 中文:\n{cn_text}"
+
+
+# ========== 文件处理工具 ==========
+class FileProcessor:
+    """处理各种文件格式的工具类"""
+
+    @staticmethod
+    def extract_text_from_file(file_path):
+        """从各种文件格式中提取文本"""
+        try:
+            text = ""
+            ext = os.path.splitext(file_path)[1].lower()
+
+            if ext == '.txt':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    text = f.read()
+
+            elif ext == '.csv':
+                df = pd.read_csv(file_path)
+                text = df.to_string()
+
+            elif ext == '.json':
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    text = json.dumps(data, ensure_ascii=False)
+
+            elif ext == '.docx':
+                doc = docx.Document(file_path)
+                text = "\n".join([para.text for para in doc.paragraphs])
+
+            elif ext == '.pdf':
+                with open(file_path, 'rb') as f:
+                    pdf_reader = PdfReader(f)
+                    for page in pdf_reader.pages:
+                        text += page.extract_text() + "\n"
+
+            elif ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                # OCR处理图片
+                text = pytesseract.image_to_string(Image.open(file_path))
+
+            elif ext in ['.html', '.htm']:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    soup = BeautifulSoup(f.read(), 'html.parser')
+                    text = soup.get_text()
+
+            elif ext in ['.xml']:
+                tree = ET.parse(file_path)
+                root = tree.getroot()
+                text = ET.tostring(root, encoding='unicode', method='text')
+
+            else:
+                # 尝试作为文本文件读取
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        text = f.read()
+                except:
+                    logger.warning(f"不支持的文件格式: {file_path}")
+                    return ""
+
+            return text
+
+        except Exception as e:
+            logger.error(f"文件处理错误 {file_path}: {str(e)}")
+            return ""
 
 
 # ========== FAISS向量数据库 ==========
@@ -227,15 +322,15 @@ class FAISSVectorDB:
 
 # ========== 本地知识图谱系统 ==========
 class LocalKnowledgeGraph:
-    """本地知识图谱实现，不依赖外部数据库"""
+    """本地知识图谱实现"""
 
     def __init__(self, config):
         self.config = config
         self.graph = nx.MultiDiGraph()
         self.entity_types = ["disease", "symptom", "medication", "test", "anatomy"]
         self.relation_counter = {rel: 0 for rel in self.config.kg_relation_types}
-        self.entity_dict = {}  # 实体ID到实体的映射
-        self.entity_name_to_id = {}  # 实体名称到ID的映射
+        self.entity_dict = {}
+        self.entity_name_to_id = {}
         self.graph_file = os.path.join(config.neo4j_dir, "local_knowledge_graph.pkl")
 
     def add_entity(self, entity_id, entity_type, properties=None):
@@ -314,6 +409,10 @@ class LocalKnowledgeGraph:
 
     def visualize(self, filename="knowledge_graph.png"):
         """可视化知识图谱"""
+        if len(self.graph.nodes()) == 0:
+            logger.warning("知识图谱为空，无法可视化")
+            return None
+
         plt.figure(figsize=(20, 15))
 
         # 根据实体类型设置颜色
@@ -378,7 +477,7 @@ class LocalKnowledgeGraph:
         plt.tight_layout()
 
         # 保存图像
-        filepath = os.path.join(self.config.kg_dir, filename)
+        filepath = os.path.join(self.config.viz_dir, filename)
         plt.savefig(filepath, dpi=300, bbox_inches='tight')
         plt.close()
 
@@ -443,118 +542,125 @@ class LocalKnowledgeGraph:
             return True
         return False
 
-    def cypher_query(self, query):
-        """模拟Cypher查询，用于本地知识图谱"""
-        # 简单的查询解析，支持基本模式匹配
-        if "MATCH" in query and "RETURN" in query:
-            # 提取模式部分
-            match_part = query.split("MATCH")[1].split("RETURN")[0].strip()
-
-            # 简单的关系模式匹配 (a)-[r]->(b)
-            if ")-[" in match_part and "]->(" in match_part:
-                parts = match_part.split(")-[")
-                left_entity = parts[0].replace("(", "").strip()
-
-                rel_parts = parts[1].split("]->")
-                rel_type = rel_parts[0].replace(":", "").replace("]", "").strip()
-
-                right_entity = rel_parts[1].replace(")", "").strip()
-
-                # 执行查询
-                results = []
-                for node_id, node_data in self.graph.nodes(data=True):
-                    if left_entity in node_data.get('type', '') or left_entity == node_id:
-                        for _, neighbor, key, edge_data in self.graph.edges(node_id, keys=True, data=True):
-                            if key == rel_type:
-                                neighbor_data = self.graph.nodes[neighbor]
-                                if right_entity in neighbor_data.get('type', '') or right_entity == neighbor:
-                                    results.append({
-                                        left_entity: node_data,
-                                        rel_type: edge_data,
-                                        right_entity: neighbor_data
-                                    })
-
-                return results
-
-        # 默认返回空结果
-        return []
-
-
-# ========== Neo4j知识图谱系统 ==========
-class Neo4jKnowledgeGraph:
-    """Neo4j知识图谱实现，需要安装Neo4j数据库"""
-
-    def __init__(self, config):
-        self.config = config
-        self.graph = None
-        self.connected = False
-
-        if config.use_neo4j:
-            self.connect()
-
-    def connect(self):
-        """连接到Neo4j数据库"""
+    def import_from_file(self, file_path):
+        """从文件导入知识图谱"""
         try:
-            self.graph = Graph(
-                self.config.neo4j_uri,
-                auth=(self.config.neo4j_user, self.config.neo4j_password)
+            file_processor = FileProcessor()
+            content = file_processor.extract_text_from_file(file_path)
+
+            if not content:
+                logger.error(f"无法从文件提取内容: {file_path}")
+                return False
+
+            # 使用OLLAMA分析内容并构建知识图谱
+            return self.build_with_ollama(content, file_path)
+
+        except Exception as e:
+            logger.error(f"导入知识图谱失败: {str(e)}")
+            return False
+
+    def build_with_ollama(self, content, source_info):
+        """使用OLLAMA分析内容并构建知识图谱"""
+        try:
+            # 使用OLLAMA提取医疗实体和关系
+            prompt = f"""
+            请从以下医疗文本中提取疾病、症状、药物、检查和身体部位等实体，以及它们之间的关系。
+            文本内容:
+            {content[:4000]}  # 限制文本长度
+
+            请以JSON格式返回结果，包含以下结构:
+            {{
+                "entities": [
+                    {{
+                        "type": "疾病/症状/药物/检查/身体部位",
+                        "name": "实体名称",
+                        "properties": {{}}
+                    }}
+                ],
+                "relations": [
+                    {{
+                        "source": "源实体名称",
+                        "target": "目标实体名称",
+                        "type": "关系类型",
+                        "properties": {{}}
+                    }}
+                ]
+            }}
+            """
+
+            response = ollama.chat(
+                model=self.config.ollama_model,
+                messages=[{'role': 'user', 'content': prompt}]
             )
-            self.connected = True
-            logger.info("成功连接到Neo4j数据库")
-        except Exception as e:
-            logger.error(f"连接Neo4j数据库失败: {str(e)}")
-            self.connected = False
 
-    def add_entity(self, entity_id, entity_type, properties=None):
-        """添加实体到知识图谱"""
-        if not self.connected:
+            result_text = response['message']['content']
+
+            # 提取JSON部分
+            json_match = re.search(r'\{[\s\S]*\}', result_text)
+            if json_match:
+                result_data = json.loads(json_match.group())
+
+                # 创建实体映射
+                entity_map = {}
+                for entity in result_data.get('entities', []):
+                    entity_id = f"{entity['type']}_{len(entity_map)}"
+                    entity_map[entity['name']] = entity_id
+                    self.add_entity(entity_id, entity['type'], {
+                        'name': entity['name'],
+                        'source': source_info,
+                        **entity.get('properties', {})
+                    })
+
+                # 创建关系
+                for relation in result_data.get('relations', []):
+                    source_id = entity_map.get(relation['source'])
+                    target_id = entity_map.get(relation['target'])
+
+                    if source_id and target_id:
+                        self.add_relation(
+                            source_id,
+                            target_id,
+                            relation['type'],
+                            relation.get('properties', {})
+                        )
+
+                logger.info(
+                    f"使用OLLAMA从 {source_info} 提取了 {len(entity_map)} 个实体和 {len(result_data.get('relations', []))} 个关系")
+                return True
+            else:
+                logger.error("OLLAMA响应中没有找到有效的JSON数据")
+                return False
+
+        except Exception as e:
+            logger.error(f"使用OLLAMA构建知识图谱失败: {str(e)}")
             return False
 
-        if properties is None:
-            properties = {}
+    def validate_graph(self):
+        """验证知识图谱的完整性"""
+        issues = []
 
-        properties['id'] = entity_id
-        properties['type'] = entity_type
+        # 检查孤立节点
+        isolated_nodes = list(nx.isolates(self.graph))
+        if isolated_nodes:
+            issues.append(f"发现 {len(isolated_nodes)} 个孤立节点")
 
-        try:
-            node = Node(entity_type, **properties)
-            self.graph.create(node)
-            return True
-        except Exception as e:
-            logger.error(f"添加实体失败: {str(e)}")
-            return False
+        # 检查重复实体
+        name_count = {}
+        for node, data in self.graph.nodes(data=True):
+            if 'name' in data:
+                name = data['name']
+                name_count[name] = name_count.get(name, 0) + 1
 
-    def add_relation(self, source_id, target_id, relation_type, properties=None):
-        """添加关系到知识图谱"""
-        if not self.connected:
-            return False
+        duplicates = {name: count for name, count in name_count.items() if count > 1}
+        if duplicates:
+            issues.append(f"发现 {len(duplicates)} 个重复实体名称")
 
-        if properties is None:
-            properties = {}
+        # 检查无效关系
+        for u, v, key in self.graph.edges(keys=True):
+            if key not in self.config.kg_relation_types:
+                issues.append(f"发现无效关系类型: {key}")
 
-        try:
-            query = (
-                f"MATCH (a), (b) "
-                f"WHERE a.id = '{source_id}' AND b.id = '{target_id}' "
-                f"CREATE (a)-[r:{relation_type} $props]->(b)"
-            )
-            self.graph.run(query, props=properties)
-            return True
-        except Exception as e:
-            logger.error(f"添加关系失败: {str(e)}")
-            return False
-
-    def cypher_query(self, query):
-        """执行Cypher查询"""
-        if not self.connected:
-            return []
-
-        try:
-            result = self.graph.run(query)
-            return [dict(record) for record in result]
-        except Exception as e:
-            logger.error(f"Cypher查询失败: {str(e)}")
-            return []
+        return issues if issues else ["知识图谱验证通过，无发现问题"]
 
 
 # ========== 知识图谱工厂 ==========
@@ -563,10 +669,7 @@ class KnowledgeGraphFactory:
 
     @staticmethod
     def create_knowledge_graph(config):
-        if config.use_neo4j:
-            return Neo4jKnowledgeGraph(config)
-        else:
-            return LocalKnowledgeGraph(config)
+        return LocalKnowledgeGraph(config)
 
 
 # ========== 医疗数据集 ==========
@@ -631,278 +734,80 @@ class MedicalKnowledgeBase:
                     f"{self.learning_stats['kg_entities']}个知识图谱实体, "
                     f"{self.learning_stats['kg_relations']}个知识图谱关系")
 
-    def extract_medical_info(self, text, file_path):
-        """从文本中提取医疗信息"""
-        try:
-            # 保存完整知识
-            self.full_knowledge.append({
-                "file_path": file_path,
-                "content": text,
-                "size_kb": len(text.encode('utf-8')) / 1024
-            })
-            self.learning_stats["total_size_kb"] += len(text.encode('utf-8')) / 1024
-
-            # 疾病提取
-            disease_pattern = r'(?:disease|condition|illness|diagnosis|疾病|病症|诊断)[\s:：]*([^\n]+)'
-            disease_matches = re.findall(disease_pattern, text, re.IGNORECASE)
-
-            for match in disease_matches:
-                disease_name = match.strip().split('\n')[0].split(',')[0].strip()
-
-                # 添加到知识图谱
-                disease_id = f"disease_{len(self.disease_info)}"
-                self.knowledge_graph.add_entity(disease_id, "disease", {"name": disease_name})
-                self.learning_stats["kg_entities"] += 1
-
-                # 症状提取
-                symptoms = []
-                symptom_pattern = r'(?:symptoms|signs|complaint|症状|体征|不适)[\s:：]*([^\n]+)'
-                symptom_matches = re.findall(symptom_pattern, text, re.IGNORECASE)
-                for sm in symptom_matches:
-                    symptoms.extend([s.strip() for s in re.split(r'[,，、]', sm)])
-
-                    # 添加到知识图谱
-                    for symptom in symptoms:
-                        symptom_id = f"symptom_{len(self.symptom_info)}"
-                        self.knowledge_graph.add_entity(symptom_id, "symptom", {"name": symptom})
-                        self.knowledge_graph.add_relation(disease_id, symptom_id, "has_symptom")
-                        self.knowledge_graph.add_relation(symptom_id, disease_id, "symptom_of")
-                        self.learning_stats["kg_entities"] += 1
-                        self.learning_stats["kg_relations"] += 2
-
-                # 药物提取
-                medications = []
-                medication_pattern = r'(?:medications|drugs|prescriptions|剂量|药物)[\s:：]*([^\n]+)'
-                medication_matches = re.findall(medication_pattern, text, re.IGNORECASE)
-
-                for mm in medication_matches:
-                    for line in mm.split('\n'):
-                        med_match = re.search(
-                            r'([a-zA-Z\u4e00-\u9fff]+[\s\-]*[a-zA-Z\u4e00-\u9fff]*\d*)[\s(]*([\d.]+[a-zA-Z\u4e00-\u9fff/]+)\s*(?:DDD:?\s*([\d.]+))?',
-                            line, re.IGNORECASE)
-                        if med_match:
-                            name = med_match.group(1).strip()
-                            specification = med_match.group(2).strip() if med_match.group(2) else ""
-                            ddd_value = float(med_match.group(3)) if med_match.group(3) else None
-
-                            medications.append({
-                                'name': name,
-                                'specification': specification,
-                                'ddd': ddd_value
-                            })
-
-                            # 添加到知识图谱
-                            med_id = f"medication_{len(medications)}"
-                            self.knowledge_graph.add_entity(med_id, "medication", {
-                                "name": name,
-                                "specification": specification,
-                                "ddd": ddd_value
-                            })
-                            self.knowledge_graph.add_relation(disease_id, med_id, "treated_with")
-                            self.learning_stats["kg_entities"] += 1
-                            self.learning_stats["kg_relations"] += 1
-
-                # 检查提取
-                tests = []
-                test_pattern = r'(?:tests|examinations|diagnostic procedures|检查|检验|检测)[\s:：]*([^\n]+)'
-                test_matches = re.findall(test_pattern, text, re.IGNORECASE)
-                for tm in test_matches:
-                    tests.extend([t.strip() for t in re.split(r'[,，、]', tm)])
-
-                    # 添加到知识图谱
-                    for test in tests:
-                        test_id = f"test_{len(tests)}"
-                        self.knowledge_graph.add_entity(test_id, "test", {"name": test})
-                        self.knowledge_graph.add_relation(disease_id, test_id, "diagnosed_by")
-                        self.learning_stats["kg_entities"] += 1
-                        self.learning_stats["kg_relations"] += 1
-
-                # 保存疾病信息
-                if disease_name and disease_name not in self.disease_info:
-                    self.disease_info[disease_name] = {
-                        "symptoms": symptoms,
-                        "medications": medications,
-                        "tests": tests
-                    }
-                    self.learning_stats["diseases_extracted"] += 1
-                    self.learning_stats["medications_extracted"] += len(medications)
-                    self.learning_stats["tests_extracted"] += len(tests)
-
-                    # 存储药物DDD信息
-                    for med in medications:
-                        if med['ddd'] is not None:
-                            self.medication_ddd_info[med['name']] = med['ddd']
-
-            # 提取症状信息
-            symptom_names = set()
-            for symptom_list in [info["symptoms"] for info in self.disease_info.values()]:
-                symptom_names.update(symptom_list)
-
-            for symptom in symptom_names:
-                if symptom and symptom not in self.symptom_info:
-                    self.symptom_info[symptom] = {
-                        "description": "",
-                        "related_tests": []
-                    }
-                    self.learning_stats["symptoms_extracted"] += 1
-
-            return True
-        except Exception as e:
-            logger.error(f"医疗信息提取错误: {str(e)}")
-            return False
-
-    async def calculate_ddd(self, medication, specification):
-        """计算DDD值"""
-        if medication in self.medication_ddd_info:
-            ddd_value = self.medication_ddd_info[medication]
-            return ddd_value, None
-
-        alternatives = await self.find_alternative_medications(medication)
-        if alternatives:
-            return None, alternatives
-
-        ddd_value = self.predict_ddd_with_model(medication, specification)
-        if ddd_value is not None:
-            return ddd_value, None
-        else:
-            return None, ["知识库中没有DDD值相关信息，请更新知识库"]
-
-    async def find_alternative_medications(self, medication):
-        """在知识库中寻找替代药物"""
-        alternatives = []
-        for disease, info in self.disease_info.items():
-            for med in info.get("medications", []):
-                med_name = med["name"]
-                if await self.is_similar_medication(medication, med_name) and med_name != medication:
-                    alternatives.append({
-                        "name": med_name,
-                        "specification": med.get("specification", "")
-                    })
-        return alternatives
-
-    async def is_similar_medication(self, med1, med2):
-        """检查药物是否相似"""
-        med1_en = await self.config.translate_to_english(med1)
-        med2_en = await self.config.translate_to_english(med2)
-
-        med1_en_lower = (med1_en or "").lower()
-        med2_en_lower = (med2_en or "").lower()
-
-        if not med1_en_lower or not med2_en_lower:
-            return False
-
-        return SequenceMatcher(None, med1_en_lower, med2_en_lower).ratio() > 0.7
-
-    def predict_ddd_with_model(self, medication, specification):
-        """使用训练好的模型预测DDD值"""
-        try:
-            model_path = os.path.join(self.config.model_dir, "ddd_predictor.model")
-            if os.path.exists(model_path):
-                if "硝苯" in medication or "nifedipine" in medication.lower():
-                    return 10.0
-                elif "氨氯" in medication or "amlodipine" in medication.lower():
-                    return 5.0
-                elif "厄贝" in medication or "irbesartan" in medication.lower():
-                    return 150.0
-                else:
-                    try:
-                        numbers = re.findall(r'\d+', specification)
-                        if numbers:
-                            dosage_val = float(numbers[0])
-                            return dosage_val * 1.5
-                    except:
-                        return 10.0
-            else:
-                logger.warning("未找到训练好的DDD预测模型")
-                return None
-        except Exception as e:
-            logger.error(f"DDD预测错误: {str(e)}")
-            return None
-
     def load_knowledge(self):
         """从知识库文件夹加载所有知识库文件"""
         logger.info("从本地知识库文件夹加载医疗知识...")
 
+        # 询问用户知识图谱构建方式
+        print("\n请选择知识图谱构建方式:")
+        print("1. 自动从知识库学习生成知识图谱")
+        print("2. 导入已有的知识图谱文件")
+        choice = input("请输入选择 (1 或 2，直接回车默认选择1): ").strip()
+
+        if choice == "2":
+            import_file = input("请输入知识图谱文件路径: ").strip()
+            if os.path.exists(import_file):
+                if self.knowledge_graph.import_from_file(import_file):
+                    logger.info("知识图谱导入成功")
+                    # 验证知识图谱
+                    validation_issues = self.knowledge_graph.validate_graph()
+                    for issue in validation_issues:
+                        logger.info(f"知识图谱验证: {issue}")
+
+                    # 可视化知识图谱
+                    self.knowledge_graph.visualize()
+                    self.knowledge_graph.export_to_json()
+                    self.knowledge_graph.save()
+                    return
+                else:
+                    logger.error("知识图谱导入失败，将使用自动学习模式")
+            else:
+                logger.error("文件不存在，将使用自动学习模式")
+
+        # 自动学习模式
+        logger.info("使用自动学习模式构建知识图谱...")
+
         # 尝试加载已有的知识图谱
-        if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
-            if self.knowledge_graph.load():
-                logger.info("成功加载已有的知识图谱")
-                return
+        if self.knowledge_graph.load():
+            logger.info("成功加载已有的知识图谱")
+            return
 
-        for path in self.config.knowledge_paths:
-            if not os.path.exists(path):
-                logger.warning(f"知识路径未找到: {path}")
-                continue
+        file_processor = FileProcessor()
+        documents = []  # 用于FAISS索引的文档
 
-            logger.info(f"处理目录: {path}")
-            file_count = 0
-            documents = []  # 用于FAISS索引的文档
+        # 处理知识库目录中的所有文件
+        for root, _, files in os.walk(self.config.knowledge_base_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                logger.info(f"处理文件: {file_path}")
 
-            for root, _, files in os.walk(path):
-                for file in files:
-                    file_path = os.path.join(root, file)
-                    if any(file_path.endswith(ext) for ext in ('.txt', '.csv', '.json', '.docx', '.pdf')):
-                        logger.info(f"处理文件: {file_path}")
-                        try:
-                            content = self.load_file(file_path)
-                            self.extract_medical_info(content, file_path)
-                            documents.append(content)  # 添加到文档列表
-                            file_count += 1
-                            self.learning_stats["files_processed"] += 1
-                        except Exception as e:
-                            logger.error(f"文件处理错误 {file_path}: {str(e)}")
+                try:
+                    content = file_processor.extract_text_from_file(file_path)
+                    if content:
+                        # 使用OLLAMA分析内容并构建知识图谱
+                        self.knowledge_graph.build_with_ollama(content, file_path)
+                        documents.append(content)
+                        self.learning_stats["files_processed"] += 1
+                        self.learning_stats["total_size_kb"] += len(content.encode('utf-8')) / 1024
+                except Exception as e:
+                    logger.error(f"文件处理错误 {file_path}: {str(e)}")
 
-            logger.info(f"在路径中处理文件数: {file_count}")
-
-            # 构建FAISS索引
-            if documents:
-                self.faiss_db.build_index(documents)
+        # 构建FAISS索引
+        if documents:
+            self.faiss_db.build_index(documents)
 
         # 可视化知识图谱
-        if self.learning_stats["kg_entities"] > 0:
-            if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
-                self.knowledge_graph.visualize()
-                self.knowledge_graph.export_to_json()
-                self.knowledge_graph.save()
+        if self.knowledge_graph.graph.number_of_nodes() > 0:
+            self.knowledge_graph.visualize()
+            self.knowledge_graph.export_to_json()
+            self.knowledge_graph.save()
 
-        if not self.disease_info:
-            logger.warning("知识库文件中未提取到疾病")
-        if not self.symptom_info:
-            logger.warning("知识库文件中未提取到症状")
-        if not self.full_knowledge:
+            # 更新学习统计
+            self.learning_stats["kg_entities"] = self.knowledge_graph.graph.number_of_nodes()
+            self.learning_stats["kg_relations"] = self.knowledge_graph.graph.number_of_edges()
+
+        if self.learning_stats["files_processed"] == 0:
             logger.warning("知识库未加载任何内容")
-
-    def load_file(self, file_path):
-        """加载单个知识文件"""
-        try:
-            content = ""
-            if file_path.endswith('.txt'):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            elif file_path.endswith('.csv'):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    reader = csv.reader(f)
-                    content = "\n".join([",".join(row) for row in reader])
-            elif file_path.endswith('.json'):
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    content = json.dumps(data, ensure_ascii=False)
-            elif file_path.endswith('.docx'):
-                doc = docx.Document(file_path)
-                content = "\n".join([para.text for para in doc.paragraphs])
-            elif file_path.endswith('.pdf'):
-                with open(file_path, 'rb') as f:
-                    pdf_reader = PdfReader(f)
-                    for page in pdf_reader.pages:
-                        content += page.extract_text() + "\n"
-            else:
-                logger.warning(f"不支持的文件格式: {file_path}")
-                return ""
-
-            return content
-        except Exception as e:
-            logger.error(f"文件加载错误 {file_path}: {str(e)}")
-            return ""
 
     def prepare_training_data(self):
         """准备训练数据"""
@@ -910,18 +815,30 @@ class MedicalKnowledgeBase:
         labels = []
         label_map = {}
 
-        for i, (disease, info) in enumerate(self.disease_info.items()):
-            if disease not in label_map:
-                label_map[disease] = len(label_map)
+        # 从知识图谱中提取训练数据
+        for node, data in self.knowledge_graph.graph.nodes(data=True):
+            if data.get('type') == 'disease' and 'name' in data:
+                disease_name = data['name']
 
-            symptoms_text = ", ".join(info.get("symptoms", []))
-            if symptoms_text:
-                texts.append(symptoms_text)
-                labels.append(label_map[disease])
+                if disease_name not in label_map:
+                    label_map[disease_name] = len(label_map)
 
-            disease_text = f"{disease} with symptoms: {symptoms_text}"
-            texts.append(disease_text)
-            labels.append(label_map[disease])
+                # 获取相关症状
+                symptoms = []
+                for _, neighbor, key in self.knowledge_graph.graph.edges(node, keys=True):
+                    if key == 'has_symptom':
+                        neighbor_data = self.knowledge_graph.graph.nodes[neighbor]
+                        if 'name' in neighbor_data:
+                            symptoms.append(neighbor_data['name'])
+
+                if symptoms:
+                    symptoms_text = ", ".join(symptoms)
+                    texts.append(symptoms_text)
+                    labels.append(label_map[disease_name])
+
+                    disease_text = f"{disease_name} with symptoms: {symptoms_text}"
+                    texts.append(disease_text)
+                    labels.append(label_map[disease_name])
 
         return texts, labels, label_map
 
@@ -931,25 +848,21 @@ class MedicalKnowledgeBase:
 
     def kg_query(self, query):
         """执行知识图谱查询"""
-        if isinstance(self.knowledge_graph, LocalKnowledgeGraph):
-            # 本地知识图谱查询
-            if "MATCH" in query.upper():
-                return self.knowledge_graph.cypher_query(query)
-            else:
-                # 简单关键词查询
-                results = []
-                for entity_name in self.knowledge_graph.entity_name_to_id.keys():
-                    if query.lower() in entity_name.lower():
-                        entity_id = self.knowledge_graph.entity_name_to_id[entity_name]
-                        entity_data = self.knowledge_graph.entity_dict[entity_id]
-                        results.append({
-                            'entity': entity_data,
-                            'related': self.knowledge_graph.find_related_entities(entity_id)
-                        })
-                return results
-        else:
-            # Neo4j查询
-            return self.knowledge_graph.cypher_query(query)
+        # 简单关键词查询
+        results = []
+        for entity_name in self.knowledge_graph.entity_name_to_id.keys():
+            if query.lower() in entity_name.lower():
+                entity_id = self.knowledge_graph.entity_name_to_id[entity_name]
+                entity_data = self.knowledge_graph.entity_dict[entity_id]
+                results.append({
+                    'entity': entity_data,
+                    'related': self.knowledge_graph.find_related_entities(entity_id)
+                })
+        return results
+
+    def validate_knowledge_graph(self):
+        """验证知识图谱的完整性"""
+        return self.knowledge_graph.validate_graph()
 
 
 # ========== 医疗AI模型 ==========
@@ -1099,6 +1012,31 @@ class TrainingMonitor:
         logger.info(f"思考过程图已保存: {filepath}")
         return filepath
 
+    def plot_resource_usage(self, filename="resource_usage.png"):
+        """绘制资源使用情况图"""
+        plt.figure(figsize=(12, 6))
+
+        time_points = range(len(self.cpu_usages))
+
+        plt.plot(time_points, self.cpu_usages, label='CPU Usage', color='red', linewidth=2)
+        plt.plot(time_points, self.gpu_usages, label='GPU Usage', color='blue', linewidth=2)
+        plt.plot(time_points, self.memory_usages, label='Memory Usage', color='green', linewidth=2)
+
+        plt.xlabel('Time')
+        plt.ylabel('Usage (%)')
+        plt.title('Resource Usage During Training')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+
+        filepath = os.path.join(self.config.viz_dir, filename)
+        plt.savefig(filepath, dpi=300, bbox_inches='tight')
+        plt.close()
+
+        logger.info(f"资源使用图已保存: {filepath}")
+        return filepath
+
 
 # ========== 医疗助手 ==========
 class MedicalAssistant:
@@ -1172,13 +1110,11 @@ class MedicalAssistant:
         expanded_symptoms = symptoms.copy()
 
         for symptom in symptoms:
-            # 使用知识图谱查询相关症状
-            query = f"MATCH (s:symptom)-[:symptom_of]->(d:disease) WHERE s.name CONTAINS '{symptom}' RETURN s.name as symptom_name"
-            kg_results = self.knowledge_base.kg_query(query)
-
-            for result in kg_results:
-                if 'symptom_name' in result and result['symptom_name'] not in expanded_symptoms:
-                    expanded_symptoms.append(result['symptom_name'])
+            # 查找相关症状
+            related_entities = self.knowledge_graph.find_related_entities(symptom)
+            for entity, data in related_entities:
+                if data.get('type') == 'symptom' and 'name' in data and data['name'] not in expanded_symptoms:
+                    expanded_symptoms.append(data['name'])
 
         return expanded_symptoms
 
@@ -1219,18 +1155,8 @@ class MedicalAssistant:
         self.thought_process.append(
             f"模型诊断: {diagnosis['disease']}/{disease_en} (置信度: {diagnosis['confidence'] * 100:.1f}%)")
 
-        # 步骤5: 用药推荐
-        medication_response = await self.recommend_medication(diagnosis['disease'])
-
-        # 步骤6: 检查建议
-        test_recommendation = await self.recommend_tests(diagnosis['disease'])
-
-        # 步骤7: 生成最终响应
-        return await self.generate_final_response(
-            diagnosis,
-            medication_response,
-            test_recommendation
-        )
+        # 步骤5: 生成最终响应
+        return await self.generate_final_response(diagnosis)
 
     async def model_based_diagnosis(self, symptoms):
         """使用训练好的模型进行诊断"""
@@ -1264,173 +1190,7 @@ class MedicalAssistant:
             "confidence": confidence_value
         }
 
-    async def calculate_symptom_match(self, complaint, symptoms):
-        """计算症状匹配度"""
-        if not symptoms:
-            return 0.0
-
-        complaint_en = await self.config.translate_to_english(complaint) or complaint.lower()
-
-        total_score = 0
-        count = 0
-
-        for symptom in symptoms:
-            symptom_en = await self.config.translate_to_english(symptom) or symptom.lower()
-
-            similarity = 1 - (Levenshtein.distance(complaint_en, symptom_en) /
-                              max(len(complaint_en), len(symptom_en)))
-
-            if similarity > 0.5:
-                total_score += similarity
-                count += 1
-
-        return total_score / count if count > 0 else 0.0
-
-    async def recommend_medication(self, disease):
-        """推荐药物"""
-        disease_en = await self.config.translate_to_english(disease)
-        self.thought_process.append(
-            f"为 {disease}/{disease_en} 推荐药物...")
-
-        # 使用知识图谱查询相关药物
-        query = f"MATCH (d:disease)-[:treated_with]->(m:medication) WHERE d.name CONTAINS '{disease}' RETURN m.name as medication, m.specification as specification, m.ddd as ddd"
-        kg_results = self.knowledge_base.kg_query(query)
-
-        medications = []
-        for result in kg_results:
-            medications.append({
-                'name': result.get('medication', ''),
-                'specification': result.get('specification', ''),
-                'ddd': result.get('ddd', None)
-            })
-
-        if not medications:
-            # 回退到原始方法
-            medications = self.knowledge_base.disease_info.get(disease, {}).get("medications", [])
-
-        if not medications:
-            return {"status": "no_medication",
-                    "message": "知识库中无相关药物信息"}
-
-        results = []
-        total_ddd = 0.0
-
-        for med in medications:
-            ddd_value, alternatives = await self.knowledge_base.calculate_ddd(
-                med["name"], med["specification"]
-            )
-
-            if ddd_value is None:
-                if alternatives and isinstance(alternatives, list) and len(alternatives) > 0:
-                    alt_text = ", ".join([f"{alt['name']} ({alt['specification']})" for alt in alternatives[:3]])
-                    results.append({
-                        "medication": med["name"],
-                        "specification": med["specification"],
-                        "status": "need_alternative",
-                        "message": f"无法计算DDD，建议换药: {alt_text}"
-                    })
-                elif alternatives and isinstance(alternatives, str):
-                    results.append({
-                        "medication": med["name"],
-                        "specification": med["specification"],
-                        "status": "no_ddd",
-                        "message": alternatives
-                    })
-                else:
-                    results.append({
-                        "medication": med["name"],
-                        "specification": med["specification"],
-                        "status": "no_ddd",
-                        "message": "无法计算DDD且无替代药物"
-                    })
-            else:
-                results.append({
-                    "medication": med["name"],
-                    "specification": med["specification"],
-                    "ddd": ddd_value,
-                    "status": "success"
-                })
-                total_ddd += ddd_value
-
-        return {
-            "status": "success" if any(r["status"] == "success" for r in results) else "partial",
-            "medications": results,
-            "total_ddd": total_ddd
-        }
-
-    async def recommend_tests(self, disease):
-        """推荐检查"""
-        disease_en = await self.config.translate_to_english(disease)
-        self.thought_process.append(
-            f"为 {disease}/{disease_en} 分析检查需求...")
-
-        # 使用知识图谱查询相关检查
-        query = f"MATCH (d:disease)-[:diagnosed_by]->(t:test) WHERE d.name CONTAINS '{disease}' RETURN t.name as test"
-        kg_results = self.knowledge_base.kg_query(query)
-
-        tests = []
-        for result in kg_results:
-            tests.append(result.get('test', ''))
-
-        if not tests:
-            # 回退到原始方法
-            disease_info = self.knowledge_base.disease_info.get(disease, {})
-            if "tests" in disease_info and disease_info["tests"]:
-                tests = disease_info["tests"]
-
-        if tests:
-            self.thought_process.append(
-                f"从知识库中找到 {len(tests)} 项检查建议")
-            return tests
-
-        # 如果没有找到检查，尝试从症状推断
-        symptoms = self.knowledge_base.disease_info.get(disease, {}).get("symptoms", [])
-        inferred_tests = await self.infer_tests_from_symptoms(symptoms)
-
-        if inferred_tests:
-            self.thought_process.append(
-                f"从 {len(symptoms)} 个症状推断出 {len(inferred_tests)} 项检查")
-            return inferred_tests
-
-        self.thought_process.append(
-            f"无法为 {disease}/{disease_en} 推荐任何检查")
-        return None
-
-    async def infer_tests_from_symptoms(self, symptoms):
-        """从症状推断检查项目"""
-        if not symptoms:
-            return []
-
-        symptom_test_mapping = {}
-        for symptom, info in self.knowledge_base.symptom_info.items():
-            if "related_tests" in info:
-                symptom_test_mapping[symptom] = info["related_tests"]
-
-        recommended_tests = []
-        for symptom in symptoms:
-            best_match = symptom
-            max_similarity = 0
-            for kb_symptom in symptom_test_mapping.keys():
-                similarity = await self.calculate_symptom_similarity(symptom, kb_symptom)
-                if similarity > max_similarity:
-                    max_similarity = similarity
-                    best_match = kb_symptom
-
-            if max_similarity > 0.7 and best_match in symptom_test_mapping:
-                recommended_tests.extend(symptom_test_mapping[best_match])
-
-        return list(set(recommended_tests))[:5]
-
-    async def calculate_symptom_similarity(self, symptom1, symptom2):
-        """计算症状相似度"""
-        symptom1_en = await self.config.translate_to_english(symptom1)
-        symptom2_en = await self.config.translate_to_english(symptom2)
-
-        if symptom1_en and symptom2_en:
-            return 1 - (Levenshtein.distance(symptom1_en, symptom2_en) / max(len(symptom1_en), len(symptom2_en)))
-        return 0.0
-
-    async def generate_final_response(self, diagnosis, medication, tests):
+    async def generate_final_response(self, diagnosis):
         """生成最终响应"""
         # 中文部分
         cn_response = f"诊断结果:\n"
@@ -1444,72 +1204,11 @@ class MedicalAssistant:
         en_response += f"Disease: {en_disease}\n"
         en_response += f"Confidence: {diagnosis['confidence'] * 100:.1f}%\n\n"
 
-        # 药物推荐 (中文)
-        cn_response += "推荐药物:\n"
-        if medication["status"] == "no_medication":
-            cn_response += "知识库中未找到相关药物信息\n"
-        else:
-            for med in medication["medications"]:
-                if med["status"] == "success":
-                    cn_response += f"- {med['medication']}: {med['specification']} (DDD值: {med['ddd']:.2f})\n"
-                elif med["status"] == "need_alternative":
-                    cn_response += f"- {med['medication']}: {med['message']}\n"
-
-            if medication["total_ddd"] > 0:
-                cn_response += f"总DDD值: {medication['total_ddd']:.2f}\n"
-
-        # 药物推荐 (英文)
-        en_response += "Medication Recommendations:\n"
-        if medication["status"] == "no_medication":
-            en_response += "No medication information found in knowledge base\n"
-        else:
-            for med in medication["medications"]:
-                if med["status"] == "success":
-                    en_med = await self.config.translate_to_english(med['medication'])
-                    en_spec = await self.translate_specification(med['specification'])
-                    en_response += f"- {en_med}: {en_spec} (DDD: {med['ddd']:.2f})\n"
-                elif med["status"] == "need_alternative":
-                    en_med = await self.config.translate_to_english(med['medication'])
-                    en_msg = await self.config.translate_to_english(med['message'])
-                    en_response += f"- {en_med}: {en_msg}\n"
-
-            if medication["total_ddd"] > 0:
-                en_response += f"Total DDD: {medication['total_ddd']:.2f}\n"
-
-        # 推荐检查 (中文)
-        if tests:
-            cn_response += "\n推荐检查:\n"
-            for test in tests:
-                cn_response += f"- {test}\n"
-
-        # 推荐检查 (英文)
-        if tests:
-            en_response += "\nRecommended Tests:\n"
-            for test in tests:
-                en_test = await self.config.translate_to_english(test)
-                en_response += f"- {en_test}\n"
-
         # 组合中英文响应
         final_response = f"🌐 中文:\n{cn_response}\n\n"
         final_response += f"🌐 ENGLISH:\n{en_response}"
 
         return final_response
-
-    async def translate_specification(self, specification):
-        """翻译药品规格"""
-        unit_mapping = {
-            "片": "tablet",
-            "粒": "capsule",
-            "毫克": "mg",
-            "毫升": "ml",
-            "/": "/"
-        }
-
-        translated = specification
-        for cn, en in unit_mapping.items():
-            translated = translated.replace(cn, en)
-
-        return translated
 
 
 # ========== 训练函数 ==========
@@ -1612,8 +1311,12 @@ async def train_model(config, knowledge_base):
                     f"Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}, "
                     f"Train Acc: {train_accuracy:.4f}, Val Acc: {val_accuracy:.4f}")
 
+    # 保存所有图表
     learning_curve_path = monitor.plot_learning_curves()
+    resource_usage_path = monitor.plot_resource_usage()
+
     logger.info(f"学习曲线已保存: {learning_curve_path}")
+    logger.info(f"资源使用图已保存: {resource_usage_path}")
 
     model_path = os.path.join(config.model_dir, "diagnosis_model.pth")
     torch.save(model.state_dict(), model_path)
@@ -1629,6 +1332,12 @@ async def main():
 
         logger.info("\n[1/4] 加载医疗知识...")
         knowledge_base = MedicalKnowledgeBase(config)
+
+        # 验证知识图谱
+        validation_results = knowledge_base.validate_knowledge_graph()
+        logger.info("知识图谱验证结果:")
+        for result in validation_results:
+            logger.info(f"  - {result}")
 
         logger.info("\n[2/4] 准备训练数据...")
         texts, labels, label_map = knowledge_base.prepare_training_data()
